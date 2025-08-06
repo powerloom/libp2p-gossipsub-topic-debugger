@@ -1,2 +1,6 @@
 #!/bin/bash
-docker-compose down --volumes --remove-orphans
+if command -v docker-compose &> /dev/null; then
+    docker-compose down --volumes --remove-orphans
+else
+    docker compose down --volumes --remove-orphans
+fi

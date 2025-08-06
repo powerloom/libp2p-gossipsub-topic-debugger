@@ -7,7 +7,13 @@ services:
       - "${LISTEN_PORT:-8001}:${LISTEN_PORT:-8001}" # Map host port to container port
     env_file:
       - .env
+    volumes:
+      # Persist logs on the host
+      - ./logs:/app/logs
+      - ./logs/archive:/app/logs/archive
     environment:
       - BOOTSTRAP_ADDR=${BOOTSTRAP_ADDR}
       - LISTEN_PORT=${LISTEN_PORT:-8001}
+      - LOG_FILE=/app/logs/p2p-debugger.log
+      - LOG_LEVEL=${LOG_LEVEL:-info}
     command: ["./p2p-debugger", "-topic", "/powerloom/snapshot-submissions/0", "-listPeers", "-listenPort", "${LISTEN_PORT:-8001}"]

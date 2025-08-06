@@ -27,6 +27,9 @@ func main() {
 	publicIP := flag.String("publicIP", "", "Public IP to advertise")
 	flag.Parse()
 
+	// Initialize logger
+	initLogger()
+
 	ctx := context.Background()
 
 	var privKey crypto.PrivKey

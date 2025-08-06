@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  p2p-debugger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${LISTEN_PORT:-8001}:${LISTEN_PORT:-8001}" # Map host port to container port
+    env_file:
+      - .env
+    environment:
+      - BOOTSTRAP_ADDR=${BOOTSTRAP_ADDR}
+      - LISTEN_PORT=${LISTEN_PORT:-8001}
+    command: ["./p2p-debugger", "-topic", "/powerloom/snapshot-submissions/0", "-listPeers", "-listenPort", "${LISTEN_PORT:-8001}"]

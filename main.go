@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"log"
 	"time"
@@ -21,6 +22,15 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
 )
+
+// P2PSnapshotSubmission represents the data structure for snapshot submissions
+// sent over the P2P network by the collector.
+type P2PSnapshotSubmission struct {
+	EpochID       uint64          `json:"epoch_id"`
+	Submissions   []interface{}   `json:"submissions"` // Using interface{} for flexibility
+	SnapshotterID string          `json:"snapshotter_id"`
+	Signature     []byte          `json:"signature"`
+}
 
 func setupDHT(ctx context.Context, h host.Host, bootstrapPeers []multiaddr.Multiaddr) (*dht.IpfsDHT, error) {
 	// Create DHT in client mode (not a bootstrap node)
@@ -266,7 +276,12 @@ func main() {
 							log.Printf("Error getting discovery topic message: %v", err)
 							continue
 						}
-						log.Printf("[DISCOVERY] Received message from %s: %s", msg.GetFrom(), string(msg.Data))
+						// Skip our own messages
+						if msg.GetFrom() == h.ID() {
+							continue
+						}
+						log.Printf("[DISCOVERY] Received message from %s", msg.GetFrom())
+						processMessage(msg.Data, "DISCOVERY")
 					}
 				}()
 			}
@@ -361,11 +376,47 @@ func main() {
 						log.Printf("Error getting next message: %v", err)
 						continue
 					}
-					log.Printf("Received message from %s: %s", msg.GetFrom(), string(msg.Data))
+					// Skip our own messages
+					if msg.GetFrom() == h.ID() {
+						continue
+					}
+					log.Printf("Received message from %s", msg.GetFrom())
+					processMessage(msg.Data, "MAIN")
 				}
 			}()
 		}
 	}
 
 	select {}
+}
+
+func processMessage(data []byte, source string) {
+	// First try to unmarshal as P2PSnapshotSubmission
+	var p2pSubmission P2PSnapshotSubmission
+	err := json.Unmarshal(data, &p2pSubmission)
+	if err == nil && p2pSubmission.SnapshotterID != "" {
+		// Successfully unmarshalled as P2P submission
+		log.Printf("[%s] P2P Submission from snapshotter %s:", source, p2pSubmission.SnapshotterID)
+		log.Printf("  Epoch ID: %d", p2pSubmission.EpochID)
+		log.Printf("  Number of submissions: %d", len(p2pSubmission.Submissions))
+		if len(p2pSubmission.Submissions) > 0 {
+			// Try to pretty print first submission
+			if submissionBytes, err := json.MarshalIndent(p2pSubmission.Submissions[0], "  ", "  "); err == nil {
+				log.Printf("  First submission: %s", string(submissionBytes))
+			}
+		}
+	} else {
+		// Try to parse as regular JSON
+		var genericMsg map[string]interface{}
+		if err := json.Unmarshal(data, &genericMsg); err == nil {
+			if prettyJSON, err := json.MarshalIndent(genericMsg, "  ", "  "); err == nil {
+				log.Printf("[%s] JSON message:\n%s", source, string(prettyJSON))
+			} else {
+				log.Printf("[%s] Message: %s", source, string(data))
+			}
+		} else {
+			// Not JSON, print as raw string
+			log.Printf("[%s] Raw message: %s", source, string(data))
+		}
+	}
 }

@@ -7,7 +7,7 @@ require (
 	github.com/libp2p/go-libp2p-kad-dht v0.34.0
 	github.com/libp2p/go-libp2p-pubsub v0.14.2
 	github.com/multiformats/go-multiaddr v0.16.1
-	github.com/powerloom/snapshot-sequencer-validator v0.0.0-20250828112017-8cc2784436cd
+	github.com/powerloom/snapshot-sequencer-validator v0.0.0-20250829130620-9c5aacc89931
 )
 
 require (

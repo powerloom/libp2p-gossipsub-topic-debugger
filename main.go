@@ -21,6 +21,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/gossipconfig"
 )
 
 // P2PSnapshotSubmission represents the data structure for snapshot submissions
@@ -233,17 +234,24 @@ func main() {
 		discoverPeers(ctx, h, routingDiscovery, *topicName)
 	}
 
-	// Create gossipsub with discovery and flood publishing
+	// Get standardized gossipsub parameters for snapshot submissions mesh
+	gossipParams, peerScoreParams, peerScoreThresholds := gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
+	
+	// Create gossipsub with standardized parameters
 	ps, err := pubsub.NewGossipSub(
 		ctx,
 		h,
+		pubsub.WithGossipSubParams(*gossipParams),
+		pubsub.WithPeerScore(peerScoreParams, peerScoreThresholds),
 		pubsub.WithDiscovery(routingDiscovery),
 		pubsub.WithFloodPublish(true),
-		pubsub.WithDirectPeers([]peer.AddrInfo{}),
+		pubsub.WithMessageSignaturePolicy(pubsub.StrictSign),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
+	
+	log.Printf("Initialized gossipsub with standardized snapshot submissions mesh parameters")
 
 	if *topicName != "" {
 		// Wait a bit for discovery to find peers

@@ -235,7 +235,7 @@ func main() {
 	}
 
 	// Get standardized gossipsub parameters for snapshot submissions mesh
-	gossipParams, peerScoreParams, peerScoreThresholds := gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
+	gossipParams, peerScoreParams, peerScoreThresholds, paramHash := gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
 	
 	// Create gossipsub with standardized parameters
 	ps, err := pubsub.NewGossipSub(
@@ -251,6 +251,7 @@ func main() {
 		log.Fatal(err)
 	}
 	
+	log.Printf("🔑 Gossipsub parameter hash: %s (p2p-debugger %s mode)", paramHash, mode)
 	log.Printf("Initialized gossipsub with standardized snapshot submissions mesh parameters")
 
 	if *topicName != "" {

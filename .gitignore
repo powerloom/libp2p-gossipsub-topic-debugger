@@ -1,2 +1,16 @@
 .env
 *.xml
+
+# Binary files (never commit)
+p2p-debugger
+main
+
+# Build artifacts
+*.test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Binary output directory if using one
+bin/

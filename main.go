@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"strconv"
 	"time"
 
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/gossipconfig"
 )
@@ -97,6 +99,20 @@ func discoverPeers(ctx context.Context, h host.Host, routingDiscovery *routing.R
 	}()
 }
 
+// getEnvAsInt gets an environment variable as an integer with a default value
+func getEnvAsInt(key string, defaultValue int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue
+	}
+	intVal, err := strconv.Atoi(val)
+	if err != nil {
+		log.Printf("Invalid value for %s: %s, using default: %d", key, val, defaultValue)
+		return defaultValue
+	}
+	return intVal
+}
+
 func main() {
 	// Command line flags with env var fallbacks
 	privateKeyHex := flag.String("privateKey", os.Getenv("PRIVATE_KEY"), "Hex-encoded private key")
@@ -163,8 +179,20 @@ func main() {
 
 	ctx := context.Background()
 
+	// Configure connection manager for testing/debugging
+	connLowWater := getEnvAsInt("CONN_MANAGER_LOW_WATER", 20)
+	connHighWater := getEnvAsInt("CONN_MANAGER_HIGH_WATER", 100)
+	connMgr, err := connmgr.NewConnManager(
+		connLowWater,
+		connHighWater,
+		connmgr.WithGracePeriod(time.Minute),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create connection manager: %v", err)
+	}
+	log.Printf("Connection manager configured: LowWater=%d, HighWater=%d (debugger mode)", connLowWater, connHighWater)
+
 	var privKey crypto.PrivKey
-	var err error
 	if *privateKeyHex == "" {
 		privKey, _, err = crypto.GenerateEd25519Key(rand.Reader)
 		if err != nil {
@@ -185,6 +213,7 @@ func main() {
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", *listenPort)),
 		libp2p.EnableRelay(),
+		libp2p.ConnectionManager(connMgr),
 	}
 
 	if *publicIP != "" {
@@ -235,7 +264,7 @@ func main() {
 	}
 
 	// Get standardized gossipsub parameters for snapshot submissions mesh
-	gossipParams, peerScoreParams, peerScoreThresholds := gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
+	gossipParams, peerScoreParams, peerScoreThresholds, paramHash := gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
 	
 	// Create gossipsub with standardized parameters
 	ps, err := pubsub.NewGossipSub(
@@ -251,6 +280,7 @@ func main() {
 		log.Fatal(err)
 	}
 	
+	log.Printf("🔑 Gossipsub parameter hash: %s (p2p-debugger %s mode)", paramHash, mode)
 	log.Printf("Initialized gossipsub with standardized snapshot submissions mesh parameters")
 
 	if *topicName != "" {

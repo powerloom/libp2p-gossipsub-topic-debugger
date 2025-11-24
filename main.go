@@ -117,22 +117,6 @@ func main() {
 	// Command line flags with env var fallbacks
 	privateKeyHex := flag.String("privateKey", os.Getenv("PRIVATE_KEY"), "Hex-encoded private key")
 
-	// Get topic prefix from env
-	topicPrefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
-	if topicPrefix == "" {
-		topicPrefix = "/powerloom/snapshot-submissions"
-	}
-
-	// Construct topic from prefix based on MODE
-	mode := os.Getenv("MODE")
-	var topicDefault string
-	if mode == "DISCOVERY" {
-		topicDefault = topicPrefix + "/0"
-	} else {
-		topicDefault = topicPrefix + "/all"
-	}
-	topicName := flag.String("topic", topicDefault, "Gossipsub topic to subscribe/publish to")
-
 	publishMsg := flag.String("publish", os.Getenv("PUBLISH_MSG"), "Message to publish")
 	listPeers := flag.Bool("listPeers", os.Getenv("LIST_PEERS") == "true", "List peers in the topic")
 	listenPort := flag.Int("listenPort", 8001, "Port to listen on (default: 8001)")
@@ -153,6 +137,8 @@ func main() {
 		}
 	}
 
+	// Check MODE env var
+	mode := os.Getenv("MODE")
 	publishInterval := 30 // default 30 seconds
 	if envInterval := os.Getenv("PUBLISH_INTERVAL"); envInterval != "" {
 		if interval, err := fmt.Sscanf(envInterval, "%d", &publishInterval); err == nil && interval == 1 {
@@ -160,15 +146,16 @@ func main() {
 		}
 	}
 
-	// Re-read topic prefix after flag.Parse() and always set topic from prefix
-	topicPrefixAfterParse := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
-	if topicPrefixAfterParse == "" {
-		topicPrefixAfterParse = "/powerloom/snapshot-submissions"
+	// Construct topic from prefix env var
+	topicPrefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
+	if topicPrefix == "" {
+		topicPrefix = "/powerloom/snapshot-submissions"
 	}
+	var topicName string
 	if mode == "DISCOVERY" {
-		*topicName = topicPrefixAfterParse + "/0"
+		topicName = topicPrefix + "/0"
 	} else {
-		*topicName = topicPrefixAfterParse + "/all"
+		topicName = topicPrefix + "/all"
 	}
 
 	// Auto-configure based on MODE
@@ -178,16 +165,16 @@ func main() {
 			*publishMsg = "auto-test-message"
 		}
 		*listPeers = true // Also show peers in publisher mode
-		log.Printf("Running in PUBLISHER mode: publish to=%s, interval=%ds", *topicName, publishInterval)
+		log.Printf("Running in PUBLISHER mode: publish to=%s, interval=%ds", topicName, publishInterval)
 		log.Printf("Note: Will also monitor discovery topic %s/0", topicPrefix)
 	case "LISTENER":
 		*listPeers = true
 		*publishMsg = "" // Don't publish in listener mode
-		log.Printf("Running in LISTENER mode: primary topic=%s", *topicName)
+		log.Printf("Running in LISTENER mode: primary topic=%s", topicName)
 		log.Printf("Note: Will also monitor discovery topic %s/0", topicPrefix)
 	case "DISCOVERY":
 		*listPeers = true
-		log.Printf("Running in DISCOVERY mode: topic=%s", *topicName)
+		log.Printf("Running in DISCOVERY mode: topic=%s", topicName)
 	default:
 		// Use flags as provided
 		log.Printf("Running with custom configuration")
@@ -278,8 +265,8 @@ func main() {
 	discoverPeers(ctx, h, routingDiscovery, *rendezvousString)
 
 	// If a topic is specified, also discover on that topic
-	if *topicName != "" {
-		discoverPeers(ctx, h, routingDiscovery, *topicName)
+	if topicName != "" {
+		discoverPeers(ctx, h, routingDiscovery, topicName)
 	}
 
 	// Get standardized gossipsub parameters for snapshot submissions mesh
@@ -302,12 +289,12 @@ func main() {
 	log.Printf("🔑 Gossipsub parameter hash: %s (p2p-debugger %s mode)", paramHash, mode)
 	log.Printf("Initialized gossipsub with standardized snapshot submissions mesh parameters")
 
-	if *topicName != "" {
+	if topicName != "" {
 		// Wait a bit for discovery to find peers
 		log.Printf("Waiting for peer discovery...")
 		time.Sleep(5 * time.Second)
 
-		topic, err := ps.Join(*topicName)
+		topic, err := ps.Join(topicName)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -315,7 +302,7 @@ func main() {
 		// In LISTENER or PUBLISHER mode, also join the discovery topic
 		var discoveryTopic *pubsub.Topic
 		discoveryTopicName := topicPrefix + "/0"
-		if (mode == "LISTENER" || mode == "PUBLISHER") && *topicName != discoveryTopicName {
+		if (mode == "LISTENER" || mode == "PUBLISHER") && topicName != discoveryTopicName {
 			discoveryTopic, err = ps.Join(discoveryTopicName)
 			if err != nil {
 				log.Printf("Warning: Failed to join discovery topic: %v", err)
@@ -350,11 +337,11 @@ func main() {
 				for {
 					time.Sleep(5 * time.Second)
 					// List peers in the topic mesh
-					peers := ps.ListPeers(*topicName)
-					log.Printf("Peers in topic %s: %v (count: %d)", *topicName, peers, len(peers))
+					peers := ps.ListPeers(topicName)
+					log.Printf("Peers in topic %s: %v (count: %d)", topicName, peers, len(peers))
 
 					// In LISTENER or PUBLISHER mode, also show discovery topic peers
-					if (mode == "LISTENER" || mode == "PUBLISHER") && *topicName != discoveryTopicName {
+					if (mode == "LISTENER" || mode == "PUBLISHER") && topicName != discoveryTopicName {
 						discoveryPeers := ps.ListPeers(discoveryTopicName)
 						log.Printf("Peers in discovery topic (joining room): %v (count: %d)", discoveryPeers, len(discoveryPeers))
 					}
@@ -391,7 +378,7 @@ func main() {
 					if err := topic.Publish(ctx, []byte(testMessage)); err != nil {
 						log.Printf("Failed to publish message #%d: %v", messageCount, err)
 					} else {
-						log.Printf("Published message #%d to topic %s", messageCount, *topicName)
+						log.Printf("Published message #%d to topic %s", messageCount, topicName)
 						log.Printf("Message content: %s", testMessage)
 					}
 
@@ -412,7 +399,7 @@ func main() {
 					}
 
 					// Also show current peer count
-					peers := ps.ListPeers(*topicName)
+					peers := ps.ListPeers(topicName)
 					log.Printf("Current peers in topic mesh: %d", len(peers))
 
 					// Wait configured interval before next publish
@@ -424,7 +411,7 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			log.Printf("Subscribed to topic: %s", *topicName)
+			log.Printf("Subscribed to topic: %s", topicName)
 
 			// Handle incoming messages
 			go func() {

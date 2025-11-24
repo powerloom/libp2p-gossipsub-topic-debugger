@@ -123,8 +123,16 @@ func main() {
 		topicPrefix = "/powerloom/snapshot-submissions"
 	}
 
-	// Topic: Use TOPIC env var if set, otherwise construct from prefix
+	// Topic: Use TOPIC env var if set, otherwise construct from prefix based on MODE
 	topicDefault := os.Getenv("TOPIC")
+	if topicDefault == "" {
+		mode := os.Getenv("MODE")
+		if mode == "DISCOVERY" {
+			topicDefault = topicPrefix + "/0"
+		} else {
+			topicDefault = topicPrefix + "/all"
+		}
+	}
 	topicName := flag.String("topic", topicDefault, "Gossipsub topic to subscribe/publish to")
 
 	publishMsg := flag.String("publish", os.Getenv("PUBLISH_MSG"), "Message to publish")

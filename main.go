@@ -6,12 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
-	"log"
-	"strconv"
-	"time"
-
 	"fmt"
+	"log"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -148,8 +148,10 @@ func main() {
 
 	// Construct topic from prefix env var
 	topicPrefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
+	log.Printf("DEBUG: GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX='%s'", topicPrefix)
 	if topicPrefix == "" {
 		topicPrefix = "/powerloom/snapshot-submissions"
+		log.Printf("DEBUG: Using fallback prefix: %s", topicPrefix)
 	}
 	var topicName string
 	if mode == "DISCOVERY" {
@@ -157,6 +159,7 @@ func main() {
 	} else {
 		topicName = topicPrefix + "/all"
 	}
+	log.Printf("DEBUG: Constructed topic: %s", topicName)
 
 	// Auto-configure based on MODE
 	switch mode {
@@ -241,19 +244,41 @@ func main() {
 
 	log.Printf("Host created with ID: %s", h.ID())
 
-	// Parse bootstrap peers
-	bootstrapPeer := os.Getenv("BOOTSTRAP_ADDR")
-	if bootstrapPeer == "" {
-		log.Fatal("BOOTSTRAP_ADDR environment variable is required")
+	// Parse bootstrap peers (support multiple comma-separated addresses)
+	bootstrapPeersStr := os.Getenv("BOOTSTRAP_PEERS")
+	if bootstrapPeersStr == "" {
+		// Fallback to old env var names for backward compatibility
+		bootstrapPeersStr = os.Getenv("BOOTSTRAP_ADDRS")
+		if bootstrapPeersStr == "" {
+			bootstrapPeersStr = os.Getenv("BOOTSTRAP_ADDR")
+		}
+	}
+	if bootstrapPeersStr == "" {
+		log.Fatal("BOOTSTRAP_PEERS environment variable is required")
 	}
 
-	bootstrapAddr, err := multiaddr.NewMultiaddr(bootstrapPeer)
-	if err != nil {
-		log.Fatal(err)
+	// Split by comma and parse each address
+	bootstrapAddrs := []multiaddr.Multiaddr{}
+	for _, addrStr := range strings.Split(bootstrapPeersStr, ",") {
+		addrStr = strings.TrimSpace(addrStr)
+		if addrStr == "" {
+			continue
+		}
+		addr, err := multiaddr.NewMultiaddr(addrStr)
+		if err != nil {
+			log.Printf("Warning: Failed to parse bootstrap address '%s': %v", addrStr, err)
+			continue
+		}
+		bootstrapAddrs = append(bootstrapAddrs, addr)
 	}
 
+	if len(bootstrapAddrs) == 0 {
+		log.Fatal("No valid bootstrap addresses found")
+	}
+
+	log.Printf("Connecting to %d bootstrap peer(s)", len(bootstrapAddrs))
 	// Setup DHT
-	kademliaDHT, err := setupDHT(ctx, h, []multiaddr.Multiaddr{bootstrapAddr})
+	kademliaDHT, err := setupDHT(ctx, h, bootstrapAddrs)
 	if err != nil {
 		log.Fatal(err)
 	}

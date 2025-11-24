@@ -117,14 +117,14 @@ func main() {
 	// Command line flags with env var fallbacks
 	privateKeyHex := flag.String("privateKey", os.Getenv("PRIVATE_KEY"), "Hex-encoded private key")
 
-	// Topic: Use TOPIC env var, or construct from GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX + "/all"
-	topicDefault := os.Getenv("TOPIC")
-	if topicDefault == "" {
-		prefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
-		if prefix != "" {
-			topicDefault = prefix + "/all"
-		}
+	// Get topic prefix from env
+	topicPrefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
+	if topicPrefix == "" {
+		topicPrefix = "/powerloom/snapshot-submissions"
 	}
+
+	// Topic: Use TOPIC env var if set, otherwise construct from prefix
+	topicDefault := os.Getenv("TOPIC")
 	topicName := flag.String("topic", topicDefault, "Gossipsub topic to subscribe/publish to")
 
 	publishMsg := flag.String("publish", os.Getenv("PUBLISH_MSG"), "Message to publish")
@@ -156,22 +156,18 @@ func main() {
 		}
 	}
 
-	// Get topic prefix from env for constructing topics
-	getTopicPrefix := func() string {
-		prefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
-		if prefix == "" {
-			return "/powerloom/snapshot-submissions"
+	// Construct topic from prefix if not explicitly set
+	if *topicName == "" {
+		if mode == "DISCOVERY" {
+			*topicName = topicPrefix + "/0"
+		} else {
+			*topicName = topicPrefix + "/all"
 		}
-		return prefix
 	}
-	topicPrefix := getTopicPrefix()
 
 	// Auto-configure based on MODE
 	switch mode {
 	case "PUBLISHER":
-		if *topicName == "" {
-			*topicName = topicPrefix + "/all"
-		}
 		if *publishMsg == "" {
 			*publishMsg = "auto-test-message"
 		}
@@ -179,17 +175,11 @@ func main() {
 		log.Printf("Running in PUBLISHER mode: publish to=%s, interval=%ds", *topicName, publishInterval)
 		log.Printf("Note: Will also monitor discovery topic %s/0", topicPrefix)
 	case "LISTENER":
-		if *topicName == "" {
-			*topicName = topicPrefix + "/all"
-		}
 		*listPeers = true
 		*publishMsg = "" // Don't publish in listener mode
 		log.Printf("Running in LISTENER mode: primary topic=%s", *topicName)
 		log.Printf("Note: Will also monitor discovery topic %s/0", topicPrefix)
 	case "DISCOVERY":
-		if *topicName == "" {
-			*topicName = topicPrefix + "/0"
-		}
 		*listPeers = true
 		log.Printf("Running in DISCOVERY mode: topic=%s", *topicName)
 	default:

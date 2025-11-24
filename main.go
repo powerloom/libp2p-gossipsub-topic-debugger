@@ -156,29 +156,39 @@ func main() {
 		}
 	}
 
+	// Get topic prefix from env for constructing topics
+	getTopicPrefix := func() string {
+		prefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
+		if prefix == "" {
+			return "/powerloom/snapshot-submissions"
+		}
+		return prefix
+	}
+	topicPrefix := getTopicPrefix()
+
 	// Auto-configure based on MODE
 	switch mode {
 	case "PUBLISHER":
 		if *topicName == "" {
-			*topicName = "/powerloom/snapshot-submissions/all"
+			*topicName = topicPrefix + "/all"
 		}
 		if *publishMsg == "" {
 			*publishMsg = "auto-test-message"
 		}
 		*listPeers = true // Also show peers in publisher mode
 		log.Printf("Running in PUBLISHER mode: publish to=%s, interval=%ds", *topicName, publishInterval)
-		log.Printf("Note: Will also monitor discovery topic /powerloom/snapshot-submissions/0")
+		log.Printf("Note: Will also monitor discovery topic %s/0", topicPrefix)
 	case "LISTENER":
 		if *topicName == "" {
-			*topicName = "/powerloom/snapshot-submissions/all"
+			*topicName = topicPrefix + "/all"
 		}
 		*listPeers = true
 		*publishMsg = "" // Don't publish in listener mode
 		log.Printf("Running in LISTENER mode: primary topic=%s", *topicName)
-		log.Printf("Note: Will also monitor discovery topic /powerloom/snapshot-submissions/0")
+		log.Printf("Note: Will also monitor discovery topic %s/0", topicPrefix)
 	case "DISCOVERY":
 		if *topicName == "" {
-			*topicName = "/powerloom/snapshot-submissions/0"
+			*topicName = topicPrefix + "/0"
 		}
 		*listPeers = true
 		log.Printf("Running in DISCOVERY mode: topic=%s", *topicName)
@@ -308,12 +318,13 @@ func main() {
 
 		// In LISTENER or PUBLISHER mode, also join the discovery topic
 		var discoveryTopic *pubsub.Topic
-		if (mode == "LISTENER" || mode == "PUBLISHER") && *topicName != "/powerloom/snapshot-submissions/0" {
-			discoveryTopic, err = ps.Join("/powerloom/snapshot-submissions/0")
+		discoveryTopicName := topicPrefix + "/0"
+		if (mode == "LISTENER" || mode == "PUBLISHER") && *topicName != discoveryTopicName {
+			discoveryTopic, err = ps.Join(discoveryTopicName)
 			if err != nil {
 				log.Printf("Warning: Failed to join discovery topic: %v", err)
 			} else {
-				log.Printf("Also joined discovery topic: /powerloom/snapshot-submissions/0")
+				log.Printf("Also joined discovery topic: %s", discoveryTopicName)
 				// Subscribe to discovery topic
 				go func() {
 					sub, err := discoveryTopic.Subscribe()
@@ -347,8 +358,8 @@ func main() {
 					log.Printf("Peers in topic %s: %v (count: %d)", *topicName, peers, len(peers))
 
 					// In LISTENER or PUBLISHER mode, also show discovery topic peers
-					if (mode == "LISTENER" || mode == "PUBLISHER") && *topicName != "/powerloom/snapshot-submissions/0" {
-						discoveryPeers := ps.ListPeers("/powerloom/snapshot-submissions/0")
+					if (mode == "LISTENER" || mode == "PUBLISHER") && *topicName != discoveryTopicName {
+						discoveryPeers := ps.ListPeers(discoveryTopicName)
 						log.Printf("Peers in discovery topic (joining room): %v (count: %d)", discoveryPeers, len(discoveryPeers))
 					}
 

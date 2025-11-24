@@ -123,15 +123,13 @@ func main() {
 		topicPrefix = "/powerloom/snapshot-submissions"
 	}
 
-	// Topic: Use TOPIC env var if set, otherwise construct from prefix based on MODE
-	topicDefault := os.Getenv("TOPIC")
-	if topicDefault == "" {
-		mode := os.Getenv("MODE")
-		if mode == "DISCOVERY" {
-			topicDefault = topicPrefix + "/0"
-		} else {
-			topicDefault = topicPrefix + "/all"
-		}
+	// Construct topic from prefix based on MODE
+	mode := os.Getenv("MODE")
+	var topicDefault string
+	if mode == "DISCOVERY" {
+		topicDefault = topicPrefix + "/0"
+	} else {
+		topicDefault = topicPrefix + "/all"
 	}
 	topicName := flag.String("topic", topicDefault, "Gossipsub topic to subscribe/publish to")
 
@@ -155,8 +153,6 @@ func main() {
 		}
 	}
 
-	// Check MODE env var for auto-configuration
-	mode := os.Getenv("MODE")
 	publishInterval := 30 // default 30 seconds
 	if envInterval := os.Getenv("PUBLISH_INTERVAL"); envInterval != "" {
 		if interval, err := fmt.Sscanf(envInterval, "%d", &publishInterval); err == nil && interval == 1 {
@@ -164,13 +160,15 @@ func main() {
 		}
 	}
 
-	// Construct topic from prefix if not explicitly set
-	if *topicName == "" {
-		if mode == "DISCOVERY" {
-			*topicName = topicPrefix + "/0"
-		} else {
-			*topicName = topicPrefix + "/all"
-		}
+	// Re-read topic prefix after flag.Parse() and always set topic from prefix
+	topicPrefixAfterParse := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
+	if topicPrefixAfterParse == "" {
+		topicPrefixAfterParse = "/powerloom/snapshot-submissions"
+	}
+	if mode == "DISCOVERY" {
+		*topicName = topicPrefixAfterParse + "/0"
+	} else {
+		*topicName = topicPrefixAfterParse + "/all"
 	}
 
 	// Auto-configure based on MODE

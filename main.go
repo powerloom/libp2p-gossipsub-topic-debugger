@@ -462,16 +462,21 @@ func main() {
 	var paramHash string
 
 	if validatorMeshMode {
-		// Use validator mesh configuration
+		// Use validator mesh configuration from shared package
 		validatorTopics := []string{discoveryTopicName, topicName}
 		if presenceTopicName != "" {
 			validatorTopics = append(validatorTopics, presenceTopicName)
 		}
-		gossipParams, peerScoreParams, peerScoreThresholds, paramHash = ConfigureValidatorVotesMesh(h.ID(), validatorTopics)
+		// This utility only listens to finalized batches, not consensus votes/proposals.
+		// Passing empty strings for consensus topics since ConfigureValidatorVotesMesh
+		// requires them but we don't join those topics.
+		gossipParams, peerScoreParams, peerScoreThresholds = gossipconfig.ConfigureValidatorVotesMesh(h.ID(), validatorTopics, "", "")
+		paramHash = gossipconfig.GenerateParamHash(gossipParams)
 		log.Printf("Using validator mesh gossipsub configuration")
 	} else {
 		// Use snapshot submissions mesh configuration
-		gossipParams, peerScoreParams, peerScoreThresholds, paramHash = gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
+		discoveryTopic, submissionsTopic := discoveryTopicName, topicName
+		gossipParams, peerScoreParams, peerScoreThresholds, paramHash = gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID(), discoveryTopic, submissionsTopic)
 		log.Printf("Using snapshot submissions mesh gossipsub configuration")
 	}
 

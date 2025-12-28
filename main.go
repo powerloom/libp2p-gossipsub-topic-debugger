@@ -24,6 +24,8 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/gossipconfig"
+
+	contract "p2p-debugger/contract"
 )
 
 // P2PSnapshotSubmission represents the data structure for snapshot submissions
@@ -146,20 +148,48 @@ func main() {
 		}
 	}
 
-	// Construct topic from prefix env var
-	topicPrefix := os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
-	log.Printf("DEBUG: GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX='%s'", topicPrefix)
-	if topicPrefix == "" {
-		topicPrefix = "/powerloom/snapshot-submissions"
-		log.Printf("DEBUG: Using fallback prefix: %s", topicPrefix)
-	}
+	// Check if validator mesh mode is enabled
+	validatorMeshMode := os.Getenv("VALIDATOR_MESH_MODE") == "true"
+
+	var topicPrefix string
 	var topicName string
-	if mode == "DISCOVERY" {
-		topicName = topicPrefix + "/0"
-	} else {
+	var discoveryTopicName string
+	var presenceTopicName string
+
+	if validatorMeshMode {
+		// Validator mesh topics (devnet defaults)
+		topicPrefix = os.Getenv("GOSSIPSUB_FINALIZED_BATCH_PREFIX")
+		if topicPrefix == "" {
+			topicPrefix = "/powerloom/dsv-devnet-alpha/finalized-batches"
+		}
+		discoveryTopicName = topicPrefix + "/0"
 		topicName = topicPrefix + "/all"
+
+		presenceTopicName = os.Getenv("GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC")
+		if presenceTopicName == "" {
+			presenceTopicName = "/powerloom/dsv-devnet-alpha/validator/presence"
+		}
+
+		log.Printf("Running in VALIDATOR MESH mode")
+		log.Printf("Batch discovery topic: %s", discoveryTopicName)
+		log.Printf("Batch topic: %s", topicName)
+		log.Printf("Presence topic: %s", presenceTopicName)
+	} else {
+		// Snapshotter mesh topics (legacy)
+		topicPrefix = os.Getenv("GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX")
+		log.Printf("DEBUG: GOSSIPSUB_SNAPSHOT_SUBMISSION_PREFIX='%s'", topicPrefix)
+		if topicPrefix == "" {
+			topicPrefix = "/powerloom/snapshot-submissions"
+			log.Printf("DEBUG: Using fallback prefix: %s", topicPrefix)
+		}
+		if mode == "DISCOVERY" {
+			topicName = topicPrefix + "/0"
+		} else {
+			topicName = topicPrefix + "/all"
+		}
+		discoveryTopicName = topicPrefix + "/0"
+		log.Printf("DEBUG: Constructed topic: %s", topicName)
 	}
-	log.Printf("DEBUG: Constructed topic: %s", topicName)
 
 	// Auto-configure based on MODE
 	switch mode {
@@ -293,9 +323,157 @@ func main() {
 	if topicName != "" {
 		discoverPeers(ctx, h, routingDiscovery, topicName)
 	}
+	if discoveryTopicName != "" && discoveryTopicName != topicName {
+		discoverPeers(ctx, h, routingDiscovery, discoveryTopicName)
+	}
+	if presenceTopicName != "" {
+		discoverPeers(ctx, h, routingDiscovery, presenceTopicName)
+	}
 
-	// Get standardized gossipsub parameters for snapshot submissions mesh
-	gossipParams, peerScoreParams, peerScoreThresholds, paramHash := gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
+	// Initialize components for validator mesh mode
+	var batchProcessor *BatchProcessor
+	var submissionCounter *SubmissionCounter
+	var contractClient *contract.Client
+	var contractUpdater *contract.Updater
+	var windowManager *WindowManager
+	var eventMonitor *EventMonitor
+	var tallyDumper *TallyDumper
+
+	if validatorMeshMode {
+		// Get configured data market address (REQUIRED)
+		// Note: Level 2 batches don't contain dataMarket info, so we use a single configured value
+		configuredDataMarket := os.Getenv("DATA_MARKET_ADDRESS")
+		if configuredDataMarket == "" {
+			log.Fatal("DATA_MARKET_ADDRESS environment variable is required for validator mesh mode")
+		}
+		log.Printf("Using configured data market address: %s", configuredDataMarket)
+
+		// Initialize window manager
+		windowManager = NewWindowManager(ctx)
+
+		// Initialize tally dumper
+		tallyDumper = NewTallyDumper()
+		if err := tallyDumper.Initialize(ctx); err != nil {
+			log.Fatalf("Failed to initialize tally dumper: %v", err)
+		}
+
+		// Initialize batch processor with window manager
+		batchProcessor = NewBatchProcessor(ctx, windowManager)
+
+		// Set data market extractor to always return configured data market
+		// (Level 2 batches don't contain dataMarket info atm)
+		batchProcessor.SetDataMarketExtractor(func(batch *FinalizedBatch) string {
+			return configuredDataMarket
+		})
+
+		// Initialize submission counter
+		submissionCounter = NewSubmissionCounter()
+
+		// Initialize contract client (may be disabled)
+		contractClient, err = contract.NewClient()
+		if err != nil {
+			log.Fatalf("Failed to initialize contract client: %v", err)
+		}
+		defer contractClient.Close()
+
+		// Initialize contract updater
+		contractUpdater = contract.NewUpdater(contractClient)
+
+		// Set window close callback - triggers aggregation and tally dump
+		// Note: dataMarket parameter comes from EpochReleased event, but we use configured value
+		windowManager.SetWindowCloseCallback(func(epochID uint64, dataMarket string) error {
+			// Use configured data market (Level 2 batches don't contain dataMarket info atm)
+			dataMarket = configuredDataMarket
+			log.Printf("Window closed for epoch %d, dataMarket %s - finalizing tally", epochID, dataMarket)
+
+			// Aggregate batches for this epoch (aggregate once per epoch, not per data market)
+			if err := batchProcessor.aggregateEpoch(epochID, dataMarket); err != nil {
+				return fmt.Errorf("failed to aggregate epoch: %w", err)
+			}
+
+			// Get aggregated batch
+			agg := batchProcessor.GetEpochAggregation(epochID)
+			if agg == nil || agg.AggregatedBatch == nil {
+				log.Printf("No aggregated batch found for epoch %d", epochID)
+				return nil
+			}
+
+			// Extract submission counts for this data market
+			slotCounts, err := ExtractSubmissionCounts(agg.AggregatedBatch, dataMarket)
+			if err != nil {
+				return fmt.Errorf("failed to extract submission counts: %w", err)
+			}
+
+			// Update submission counter
+			if err := submissionCounter.UpdateEligibleCounts(epochID, dataMarket, slotCounts); err != nil {
+				return fmt.Errorf("failed to update eligible counts: %w", err)
+			}
+
+			// Generate tally dump for the specific data market that triggered the window close
+			eligibleNodesCount := submissionCounter.GetEligibleNodesCount(dataMarket)
+			if err := tallyDumper.Dump(epochID, dataMarket, slotCounts, eligibleNodesCount, agg.TotalValidators, agg.AggregatedProjects); err != nil {
+				log.Printf("Error generating tally dump: %v", err)
+			}
+
+			// Update contract for this data market (if enabled)
+			if err := contractUpdater.UpdateSubmissionCounts(ctx, epochID, dataMarket, slotCounts, eligibleNodesCount); err != nil {
+				log.Printf("Error updating contract for data market %s: %v", dataMarket, err)
+			}
+
+			return nil
+		})
+
+		// Initialize event monitor if RPC URL is provided
+		rpcURL := os.Getenv("POWERLOOM_RPC_URL")
+		protocolContract := os.Getenv("PROTOCOL_STATE_CONTRACT")
+
+		// Filter events by configured data market only
+		dataMarketsFilter := []string{configuredDataMarket}
+
+		if rpcURL != "" && protocolContract != "" {
+			eventMonitor, err = NewEventMonitor(ctx, rpcURL, protocolContract, dataMarketsFilter)
+			if err != nil {
+				log.Fatalf("Failed to initialize event monitor: %v", err)
+			}
+			defer eventMonitor.Close()
+
+			// Set event callback
+			eventMonitor.SetEventCallback(func(event *EpochReleasedEvent) error {
+				return windowManager.OnEpochReleased(event)
+			})
+
+			// Start event monitoring
+			if err := eventMonitor.Start(); err != nil {
+				log.Fatalf("Failed to start event monitor: %v", err)
+			}
+
+			log.Printf("Started event monitoring for protocol contract %s", protocolContract)
+		} else {
+			log.Printf("Event monitoring disabled (POWERLOOM_RPC_URL or PROTOCOL_STATE_CONTRACT not set)")
+		}
+
+		log.Printf("Initialized validator mesh components")
+	}
+
+	// Get gossipsub parameters based on mode
+	var gossipParams *pubsub.GossipSubParams
+	var peerScoreParams *pubsub.PeerScoreParams
+	var peerScoreThresholds *pubsub.PeerScoreThresholds
+	var paramHash string
+
+	if validatorMeshMode {
+		// Use validator mesh configuration
+		validatorTopics := []string{discoveryTopicName, topicName}
+		if presenceTopicName != "" {
+			validatorTopics = append(validatorTopics, presenceTopicName)
+		}
+		gossipParams, peerScoreParams, peerScoreThresholds, paramHash = ConfigureValidatorVotesMesh(h.ID(), validatorTopics)
+		log.Printf("Using validator mesh gossipsub configuration")
+	} else {
+		// Use snapshot submissions mesh configuration
+		gossipParams, peerScoreParams, peerScoreThresholds, paramHash = gossipconfig.ConfigureSnapshotSubmissionsMesh(h.ID())
+		log.Printf("Using snapshot submissions mesh gossipsub configuration")
+	}
 
 	// Create gossipsub with standardized parameters
 	ps, err := pubsub.NewGossipSub(
@@ -312,7 +490,11 @@ func main() {
 	}
 
 	log.Printf("🔑 Gossipsub parameter hash: %s (p2p-debugger %s mode)", paramHash, mode)
-	log.Printf("Initialized gossipsub with standardized snapshot submissions mesh parameters")
+	if validatorMeshMode {
+		log.Printf("Initialized gossipsub with validator mesh parameters")
+	} else {
+		log.Printf("Initialized gossipsub with standardized snapshot submissions mesh parameters")
+	}
 
 	if topicName != "" {
 		// Wait a bit for discovery to find peers
@@ -324,37 +506,53 @@ func main() {
 			log.Fatal(err)
 		}
 
-		// In LISTENER or PUBLISHER mode, also join the discovery topic
+		// Join discovery topic
 		var discoveryTopic *pubsub.Topic
-		discoveryTopicName := topicPrefix + "/0"
-		if (mode == "LISTENER" || mode == "PUBLISHER") && topicName != discoveryTopicName {
+		if discoveryTopicName != "" && topicName != discoveryTopicName {
 			discoveryTopic, err = ps.Join(discoveryTopicName)
 			if err != nil {
 				log.Printf("Warning: Failed to join discovery topic: %v", err)
 			} else {
 				log.Printf("Also joined discovery topic: %s", discoveryTopicName)
-				// Subscribe to discovery topic
-				go func() {
-					sub, err := discoveryTopic.Subscribe()
+			}
+		}
+
+		// Join presence topic (validator mesh only)
+		if validatorMeshMode && presenceTopicName != "" {
+			_, err = ps.Join(presenceTopicName)
+			if err != nil {
+				log.Printf("Warning: Failed to join presence topic: %v", err)
+			} else {
+				log.Printf("Also joined presence topic: %s", presenceTopicName)
+			}
+		}
+
+		// Subscribe to discovery topic
+		if discoveryTopic != nil {
+			go func() {
+				sub, err := discoveryTopic.Subscribe()
+				if err != nil {
+					log.Printf("Failed to subscribe to discovery topic: %v", err)
+					return
+				}
+				for {
+					msg, err := sub.Next(ctx)
 					if err != nil {
-						log.Printf("Failed to subscribe to discovery topic: %v", err)
-						return
+						log.Printf("Error getting discovery topic message: %v", err)
+						continue
 					}
-					for {
-						msg, err := sub.Next(ctx)
-						if err != nil {
-							log.Printf("Error getting discovery topic message: %v", err)
-							continue
-						}
-						// Skip our own messages
-						if msg.GetFrom() == h.ID() {
-							continue
-						}
-						log.Printf("[DISCOVERY] Received message from %s", msg.GetFrom())
+					// Skip our own messages
+					if msg.GetFrom() == h.ID() {
+						continue
+					}
+					log.Printf("[DISCOVERY] Received message from %s", msg.GetFrom())
+					if validatorMeshMode {
+						processValidatorMessage(msg.Data, batchProcessor, windowManager, "DISCOVERY")
+					} else {
 						processMessage(msg.Data, "DISCOVERY")
 					}
-				}()
-			}
+				}
+			}()
 		}
 
 		if *listPeers {
@@ -451,7 +649,11 @@ func main() {
 						continue
 					}
 					log.Printf("Received message from %s", msg.GetFrom())
-					processMessage(msg.Data, "MAIN")
+					if validatorMeshMode {
+						processValidatorMessage(msg.Data, batchProcessor, windowManager, "MAIN")
+					} else {
+						processMessage(msg.Data, "MAIN")
+					}
 				}
 			}()
 		}
@@ -483,6 +685,56 @@ func processMessage(data []byte, source string) {
 				log.Printf("[%s] JSON message:\n%s", source, string(prettyJSON))
 			} else {
 				log.Printf("[%s] Message: %s", source, string(data))
+			}
+		} else {
+			// Not JSON, print as raw string
+			log.Printf("[%s] Raw message: %s", source, string(data))
+		}
+	}
+}
+
+// processValidatorMessage processes validator batch messages
+func processValidatorMessage(data []byte, batchProcessor *BatchProcessor, windowManager *WindowManager, source string) {
+	// Try to parse as ValidatorBatch
+	vBatch, err := ParseValidatorBatchMessage(data)
+	if err == nil && vBatch.ValidatorID != "" {
+		log.Printf("[%s] Validator Batch from %s:", source, vBatch.ValidatorID)
+		log.Printf("  Epoch ID: %d", vBatch.EpochID)
+		log.Printf("  Batch IPFS CID: %s", vBatch.BatchIPFSCID)
+		log.Printf("  Project Count: %d", vBatch.ProjectCount)
+
+		// Use configured data market (Level 2 batches don't contain dataMarket info atm)
+		configuredDataMarket := os.Getenv("DATA_MARKET_ADDRESS")
+		if configuredDataMarket == "" {
+			log.Printf("Warning: DATA_MARKET_ADDRESS not set, skipping batch validation")
+			// Still process the batch, but window checks will be skipped
+		}
+
+		// Check if we can accept this batch (must be past Level 1 delay)
+		if windowManager != nil && configuredDataMarket != "" {
+			if !windowManager.CanAcceptBatch(vBatch.EpochID, configuredDataMarket) {
+				log.Printf("Skipping batch - Level 1 finalization delay not yet completed (epoch %d)", vBatch.EpochID)
+				return
+			}
+		}
+
+		// Process the batch
+		if batchProcessor != nil {
+			if err := batchProcessor.ProcessValidatorBatch(vBatch); err != nil {
+				log.Printf("Error processing validator batch: %v", err)
+			}
+		}
+	} else {
+		// Try to parse as presence message
+		var presenceMsg map[string]interface{}
+		if err := json.Unmarshal(data, &presenceMsg); err == nil {
+			if msgType, ok := presenceMsg["type"].(string); ok && msgType == "validator_presence" {
+				log.Printf("[%s] Validator presence message from %s", source, presenceMsg["peer_id"])
+			} else {
+				// Generic JSON message
+				if prettyJSON, err := json.MarshalIndent(presenceMsg, "  ", "  "); err == nil {
+					log.Printf("[%s] JSON message:\n%s", source, string(prettyJSON))
+				}
 			}
 		} else {
 			// Not JSON, print as raw string

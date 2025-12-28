@@ -7,7 +7,7 @@ RUN go mod download
 
 COPY . .
 
-RUN go build -o p2p-debugger main.go logger.go
+RUN go build -o p2p-debugger .
 
 EXPOSE 8001
 

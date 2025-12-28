@@ -11,6 +11,8 @@ services:
       # Persist logs on the host
       - ./logs:/app/logs
       - ./logs/archive:/app/logs/archive
+      # Persist tally dumps on the host
+      - ./tallies:/app/tallies
     environment:
       # Logging - always set these
       - LOG_FILE=/app/logs/p2p-debugger.log

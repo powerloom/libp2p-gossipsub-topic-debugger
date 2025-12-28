@@ -296,7 +296,7 @@ If `ENABLE_CONTRACT_UPDATES=true`:
 | `CONTRACT_UPDATE_METHOD` | `relayer` | `relayer` or `direct` |
 | `RELAYER_URL` | *required if relayer* | Relayer service URL |
 | `RELAYER_AUTH_TOKEN` | *required if relayer* | Relayer auth token |
-| `PRIVATE_KEY` | *required if direct* | Private key hex for direct calls |
+| `EVM_PRIVATE_KEY` | *required if direct* | EVM private key hex (secp256k1) for direct contract calls. Note: This is different from `PRIVATE_KEY` which is Ed25519 for libp2p peer identity. |
 
 ## Usage Examples
 
@@ -384,7 +384,7 @@ Files are automatically pruned based on retention policies.
 - Check `ENABLE_CONTRACT_UPDATES=true`
 - Verify update method configuration (relayer vs direct)
 - For relayer: check `RELAYER_URL` and `RELAYER_AUTH_TOKEN`
-- For direct: verify `PRIVATE_KEY` and RPC access
+- For direct: verify `EVM_PRIVATE_KEY` (secp256k1) and RPC access. Note: This is different from `PRIVATE_KEY` (Ed25519) used for libp2p peer identity.
 - Check epoch interval matches (updates only every N epochs)
 
 ## Development

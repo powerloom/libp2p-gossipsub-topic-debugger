@@ -21,6 +21,7 @@ type Client struct {
 	rpcURL              string
 	relayerURL          string
 	relayerAuthToken    string
+	evmPrivateKey       string // EVM private key for direct contract calls (secp256k1)
 	updateEpochInterval int64
 }
 
@@ -43,6 +44,7 @@ func NewClient() (*Client, error) {
 	rpcURL := os.Getenv("POWERLOOM_RPC_URL")
 	relayerURL := os.Getenv("RELAYER_URL")
 	relayerAuthToken := os.Getenv("RELAYER_AUTH_TOKEN")
+	evmPrivateKey := os.Getenv("EVM_PRIVATE_KEY") // EVM private key for direct contract calls
 
 	protocolContractStr := os.Getenv("PROTOCOL_STATE_CONTRACT")
 	if protocolContractStr == "" {
@@ -63,6 +65,7 @@ func NewClient() (*Client, error) {
 		rpcURL:              rpcURL,
 		relayerURL:          relayerURL,
 		relayerAuthToken:    relayerAuthToken,
+		evmPrivateKey:       evmPrivateKey,
 		updateEpochInterval: updateInterval,
 	}
 
@@ -70,6 +73,9 @@ func NewClient() (*Client, error) {
 	if updateMethod == "direct" {
 		if rpcURL == "" {
 			return nil, fmt.Errorf("POWERLOOM_RPC_URL is required when CONTRACT_UPDATE_METHOD=direct")
+		}
+		if evmPrivateKey == "" {
+			return nil, fmt.Errorf("EVM_PRIVATE_KEY is required when CONTRACT_UPDATE_METHOD=direct")
 		}
 
 		ethClient, err := ethclient.Dial(rpcURL)

@@ -1,0 +1,48 @@
+# Build artifacts
+*.log
+logs/
+*.out
+*.test
+*.prof
+
+# Dependencies
+vendor/
+node_modules/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Tally dumps (will be created at runtime)
+tallies/
+
+# Large directories that shouldn't be in build context
+debug-artifacts/
+*.zip
+*.tar.gz
+
+# Test files
+*_test.go
+testdata/
+

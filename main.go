@@ -379,22 +379,32 @@ func main() {
 		// Initialize contract updater
 		contractUpdater = contract.NewUpdater(contractClient)
 
-		// Set window close callback - triggers aggregation and tally dump
+			// Set window close callback - triggers aggregation and tally dump
 		// Note: dataMarket parameter comes from EpochReleased event, but we use configured value
 		windowManager.SetWindowCloseCallback(func(epochID uint64, dataMarket string) error {
 			// Use configured data market (Level 2 batches don't contain dataMarket info atm)
 			dataMarket = configuredDataMarket
-			log.Printf("Window closed for epoch %d, dataMarket %s - finalizing tally", epochID, dataMarket)
+			log.Printf("🔒 Window closed for epoch %d, dataMarket %s - finalizing tally", epochID, dataMarket)
+
+			// Get aggregation state before aggregating
+			agg := batchProcessor.GetEpochAggregation(epochID)
+			if agg == nil {
+				log.Printf("⚠️  No aggregation found for epoch %d", epochID)
+				return fmt.Errorf("no aggregation found for epoch %d", epochID)
+			}
+
+			log.Printf("📊 Aggregating epoch %d: %d batches received from %d validators",
+				epochID, agg.ReceivedBatches, agg.TotalValidators)
 
 			// Aggregate batches for this epoch (aggregate once per epoch, not per data market)
 			if err := batchProcessor.aggregateEpoch(epochID, dataMarket); err != nil {
 				return fmt.Errorf("failed to aggregate epoch: %w", err)
 			}
 
-			// Get aggregated batch
-			agg := batchProcessor.GetEpochAggregation(epochID)
+			// Get aggregated batch after aggregation
+			agg = batchProcessor.GetEpochAggregation(epochID)
 			if agg == nil || agg.AggregatedBatch == nil {
-				log.Printf("No aggregated batch found for epoch %d", epochID)
+				log.Printf("⚠️  No aggregated batch found for epoch %d after aggregation", epochID)
 				return nil
 			}
 
@@ -404,6 +414,8 @@ func main() {
 				return fmt.Errorf("failed to extract submission counts: %w", err)
 			}
 
+			log.Printf("📈 Extracted %d unique slot IDs for epoch %d", len(slotCounts), epochID)
+
 			// Update submission counter
 			if err := submissionCounter.UpdateEligibleCounts(epochID, dataMarket, slotCounts); err != nil {
 				return fmt.Errorf("failed to update eligible counts: %w", err)
@@ -412,12 +424,12 @@ func main() {
 			// Generate tally dump for the specific data market that triggered the window close
 			eligibleNodesCount := submissionCounter.GetEligibleNodesCount(dataMarket)
 			if err := tallyDumper.Dump(epochID, dataMarket, slotCounts, eligibleNodesCount, agg.TotalValidators, agg.AggregatedProjects); err != nil {
-				log.Printf("Error generating tally dump: %v", err)
+				log.Printf("❌ Error generating tally dump: %v", err)
 			}
 
 			// Update contract for this data market (if enabled)
 			if err := contractUpdater.UpdateSubmissionCounts(ctx, epochID, dataMarket, slotCounts, eligibleNodesCount); err != nil {
-				log.Printf("Error updating contract for data market %s: %v", dataMarket, err)
+				log.Printf("❌ Error updating contract for data market %s: %v", dataMarket, err)
 			}
 
 			return nil
@@ -653,9 +665,8 @@ func main() {
 					if msg.GetFrom() == h.ID() {
 						continue
 					}
-					log.Printf("Received message from %s", msg.GetFrom())
 					if validatorMeshMode {
-						processValidatorMessage(msg.Data, batchProcessor, windowManager, "MAIN")
+						processValidatorMessage(msg.Data, batchProcessor, windowManager, msg.GetFrom().String())
 					} else {
 						processMessage(msg.Data, "MAIN")
 					}
@@ -699,51 +710,52 @@ func processMessage(data []byte, source string) {
 }
 
 // processValidatorMessage processes validator batch messages
-func processValidatorMessage(data []byte, batchProcessor *BatchProcessor, windowManager *WindowManager, source string) {
-	// Try to parse as ValidatorBatch
-	vBatch, err := ParseValidatorBatchMessage(data)
-	if err == nil && vBatch.ValidatorID != "" {
-		log.Printf("[%s] Validator Batch from %s:", source, vBatch.ValidatorID)
-		log.Printf("  Epoch ID: %d", vBatch.EpochID)
-		log.Printf("  Batch IPFS CID: %s", vBatch.BatchIPFSCID)
-		log.Printf("  Project Count: %d", vBatch.ProjectCount)
-
+func processValidatorMessage(data []byte, batchProcessor *BatchProcessor, windowManager *WindowManager, peerID string) {
+	// Try to parse as FinalizedBatch (the actual JSON structure)
+	batch, err := ParseValidatorBatchMessage(data)
+	if err == nil && batch.SequencerId != "" && batch.EpochId > 0 {
 		// Use configured data market (Level 2 batches don't contain dataMarket info atm)
 		configuredDataMarket := os.Getenv("DATA_MARKET_ADDRESS")
 		if configuredDataMarket == "" {
-			log.Printf("Warning: DATA_MARKET_ADDRESS not set, skipping batch validation")
+			log.Printf("⚠️  Warning: DATA_MARKET_ADDRESS not set, skipping batch validation")
 			// Still process the batch, but window checks will be skipped
 		}
 
 		// Check if we can accept this batch (must be past Level 1 delay)
 		if windowManager != nil && configuredDataMarket != "" {
-			if !windowManager.CanAcceptBatch(vBatch.EpochID, configuredDataMarket) {
-				log.Printf("Skipping batch - Level 1 finalization delay not yet completed (epoch %d)", vBatch.EpochID)
+			if !windowManager.CanAcceptBatch(batch.EpochId, configuredDataMarket) {
+				log.Printf("⏸️  Skipping batch - Level 1 finalization delay not yet completed (epoch %d, validator %s)",
+					batch.EpochId, batch.SequencerId)
 				return
 			}
 		}
 
 		// Process the batch
 		if batchProcessor != nil {
-			if err := batchProcessor.ProcessValidatorBatch(vBatch); err != nil {
-				log.Printf("Error processing validator batch: %v", err)
+			if err := batchProcessor.ProcessValidatorBatch(batch); err != nil {
+				log.Printf("❌ Error processing validator batch: %v", err)
+			}
+		}
+		return
+	}
+
+	// Try to parse as presence message
+	var presenceMsg map[string]interface{}
+	if err := json.Unmarshal(data, &presenceMsg); err == nil {
+		if msgType, ok := presenceMsg["type"].(string); ok && msgType == "validator_presence" {
+			if peerIDVal, ok := presenceMsg["peer_id"].(string); ok {
+				log.Printf("👋 Validator presence: %s", peerIDVal)
+			}
+		} else {
+			// Unknown message type - log briefly
+			if epochID, ok := presenceMsg["EpochId"].(float64); ok {
+				log.Printf("📨 Unknown message type for epoch %.0f from %s", epochID, peerID)
+			} else {
+				log.Printf("📨 Unknown message from %s", peerID)
 			}
 		}
 	} else {
-		// Try to parse as presence message
-		var presenceMsg map[string]interface{}
-		if err := json.Unmarshal(data, &presenceMsg); err == nil {
-			if msgType, ok := presenceMsg["type"].(string); ok && msgType == "validator_presence" {
-				log.Printf("[%s] Validator presence message from %s", source, presenceMsg["peer_id"])
-			} else {
-				// Generic JSON message
-				if prettyJSON, err := json.MarshalIndent(presenceMsg, "  ", "  "); err == nil {
-					log.Printf("[%s] JSON message:\n%s", source, string(prettyJSON))
-				}
-			}
-		} else {
-			// Not JSON, print as raw string
-			log.Printf("[%s] Raw message: %s", source, string(data))
-		}
+		// Not JSON or parse error
+		log.Printf("⚠️  Failed to parse message from %s: %v", peerID, err)
 	}
 }

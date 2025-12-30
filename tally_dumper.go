@@ -125,13 +125,11 @@ func (td *TallyDumper) Dump(epochID uint64, dataMarket string, counts map[uint64
 		AggregatedProjects: aggregatedProjects,
 	}
 
-	// Output to stdout (structured JSON)
+	// Marshal JSON for file output
 	jsonBytes, err := json.MarshalIndent(tally, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal tally: %w", err)
 	}
-
-	log.Printf("📊 TALLY DUMP (epoch %d, dataMarket %s):\n%s", epochID, dataMarket, string(jsonBytes))
 
 	// Write to file
 	filename := fmt.Sprintf("epoch_%d_%s.json", epochID, strings.ToLower(strings.TrimPrefix(dataMarket, "0x")))
@@ -141,7 +139,9 @@ func (td *TallyDumper) Dump(epochID uint64, dataMarket string, counts map[uint64
 		return fmt.Errorf("failed to write tally file: %w", err)
 	}
 
-	log.Printf("✅ Wrote tally dump to %s", filepath)
+	// Log summary instead of full JSON
+	log.Printf("📊 TALLY DUMP: epoch=%d, dataMarket=%s, slots=%d, eligibleNodes=%d, validators=%d → %s",
+		epochID, dataMarket, len(counts), eligibleNodesCount, totalValidators, filepath)
 
 	return nil
 }

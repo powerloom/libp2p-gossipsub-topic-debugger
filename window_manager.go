@@ -39,6 +39,8 @@ type WindowManager struct {
 	mu                        sync.RWMutex
 	level1FinalizationDelay   time.Duration
 	aggregationWindowDuration time.Duration
+	level1Tolerance           time.Duration // Tolerance for accepting batches slightly before Level 1 delay completes
+	windowClosureTolerance    time.Duration // Tolerance for accepting batches slightly after window closes
 	onWindowClose             func(epochID uint64, dataMarket string) error
 }
 
@@ -58,11 +60,28 @@ func NewWindowManager(ctx context.Context) *WindowManager {
 		}
 	}
 
+	// Default tolerance: 500ms for Level 1 delay, 1 second for window closure
+	level1Tolerance := 500 * time.Millisecond
+	if toleranceStr := os.Getenv("LEVEL1_DELAY_TOLERANCE_MS"); toleranceStr != "" {
+		if tolerance, err := strconv.Atoi(toleranceStr); err == nil {
+			level1Tolerance = time.Duration(tolerance) * time.Millisecond
+		}
+	}
+
+	windowClosureTolerance := 1 * time.Second
+	if toleranceStr := os.Getenv("AGGREGATION_WINDOW_CLOSURE_TOLERANCE_MS"); toleranceStr != "" {
+		if tolerance, err := strconv.Atoi(toleranceStr); err == nil {
+			windowClosureTolerance = time.Duration(tolerance) * time.Millisecond
+		}
+	}
+
 	return &WindowManager{
 		ctx:                       ctx,
 		windows:                   make(map[string]*EpochWindow),
 		level1FinalizationDelay:   level1Delay,
 		aggregationWindowDuration: aggWindow,
+		level1Tolerance:           level1Tolerance,
+		windowClosureTolerance:    windowClosureTolerance,
 	}
 }
 
@@ -140,6 +159,13 @@ func (wm *WindowManager) startAggregationWindowTimer(window *EpochWindow) {
 		time.Sleep(delay)
 	}
 
+	// Wait for tolerance period to allow late-arriving batches
+	if wm.windowClosureTolerance > 0 {
+		log.Printf("⏳ Waiting %v tolerance period before finalizing (epoch %d, dataMarket %s)",
+			wm.windowClosureTolerance, window.EpochID, window.DataMarketAddress)
+		time.Sleep(wm.windowClosureTolerance)
+	}
+
 	// Window expired - finalize
 	wm.mu.Lock()
 	window.State = WindowStateFinalized
@@ -198,8 +224,28 @@ func (wm *WindowManager) CanAcceptBatch(epochID uint64, dataMarket string) bool 
 	window.mu.RLock()
 	defer window.mu.RUnlock()
 
-	// Can accept batches only if we're past Level 1 delay
-	return window.State == WindowStateCollectingBatches || window.State == WindowStateFinalized
+	now := time.Now()
+
+	// If we're already collecting batches or finalized, accept
+	if window.State == WindowStateCollectingBatches || window.State == WindowStateFinalized {
+		// But check if window has closed (with tolerance)
+		if window.State == WindowStateCollectingBatches {
+			// Allow batches slightly after window closes (tolerance period)
+			if now.After(window.AggregationEndsAt.Add(wm.windowClosureTolerance)) {
+				return false // Too late, window closed beyond tolerance
+			}
+		}
+		return true
+	}
+
+	// If we're waiting for Level 1 delay, check if we're within tolerance
+	if window.State == WindowStateWaitingLevel1 {
+		// Allow batches slightly before Level 1 delay completes (tolerance period)
+		effectiveLevel1End := window.Level1DelayEndsAt.Add(-wm.level1Tolerance)
+		return now.After(effectiveLevel1End) || now.Equal(effectiveLevel1End)
+	}
+
+	return false
 }
 
 // IsWindowClosed checks if the aggregation window has closed for an epoch

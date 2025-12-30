@@ -20,30 +20,46 @@ func NewSubmissionCounter() *SubmissionCounter {
 
 // ExtractSubmissionCounts extracts slot ID counts from a finalized batch for a specific data market
 // Returns map[slotID]count for the given dataMarket
-// Count represents how many unique projects each slot submitted to (not total submission entries)
+// Count represents how many unique projects each slot submitted to with >51% validator votes
+// Only submissions with majority votes (>51% of validators) are counted
 func ExtractSubmissionCounts(batch *FinalizedBatch, dataMarket string) (map[uint64]int, error) {
-	// Track slot ID -> set of projects they submitted to
+	totalValidators := batch.ValidatorCount
+	if totalValidators == 0 {
+		// Fallback: if ValidatorCount is 0, try to infer from batches
+		// This shouldn't happen after consensus, but handle gracefully
+		totalValidators = 1
+	}
+
+	// Calculate majority threshold (>51%)
+	majorityThreshold := float64(totalValidators) * 0.51
+	majorityVotes := int(majorityThreshold) + 1 // Need more than 51%
+
+	// Track slot ID -> set of projects they submitted to with majority votes
 	slotProjects := make(map[uint64]map[string]bool) // slotID -> set of projectIDs
 
 	// Iterate through SubmissionDetails and track which projects each slot submitted to
+	// Only count submissions where VoteCount > majorityThreshold
 	for projectID, submissions := range batch.SubmissionDetails {
 		for _, submission := range submissions {
-			slotID := submission.SlotID
-			if slotProjects[slotID] == nil {
-				slotProjects[slotID] = make(map[string]bool)
+			// Only count if this submission has majority votes (>51%)
+			if submission.VoteCount > majorityVotes {
+				slotID := submission.SlotID
+				if slotProjects[slotID] == nil {
+					slotProjects[slotID] = make(map[string]bool)
+				}
+				slotProjects[slotID][projectID] = true
 			}
-			slotProjects[slotID][projectID] = true
 		}
 	}
 
-	// Convert to counts map: count = number of unique projects this slot submitted to
+	// Convert to counts map: count = number of unique projects this slot submitted to with majority votes
 	counts := make(map[uint64]int)
 	for slotID, projects := range slotProjects {
 		counts[slotID] = len(projects)
 	}
 
-	log.Printf("Extracted submission counts for dataMarket %s: %d slots (projects per slot: %v)",
-		dataMarket, len(counts), counts)
+	log.Printf("Extracted submission counts for dataMarket %s: %d slots with majority votes (threshold: >%d/%d validators)",
+		dataMarket, len(counts), majorityVotes, totalValidators)
 
 	return counts, nil
 }
@@ -101,7 +117,8 @@ func (sc *SubmissionCounter) GetAllCounts() map[string]map[uint64]int {
 	return result
 }
 
-// GetEligibleNodesCount returns the number of slots with submissions > 0 for a data market
+// GetEligibleNodesCount returns the number of slots with eligible submissions (>0 projects with majority votes)
+// A slot is eligible if it has at least one submission with >51% validator votes
 func (sc *SubmissionCounter) GetEligibleNodesCount(dataMarket string) int {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
@@ -109,6 +126,7 @@ func (sc *SubmissionCounter) GetEligibleNodesCount(dataMarket string) int {
 	count := 0
 	if slotCounts, ok := sc.counts[dataMarket]; ok {
 		for _, submissionCount := range slotCounts {
+			// Count slots that have at least one project submission with majority votes
 			if submissionCount > 0 {
 				count++
 			}

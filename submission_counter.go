@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,7 +86,8 @@ func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBat
 		}
 	}
 
-	// Track (projectID, CID) -> set of validators who chose that CID (denominator)
+	// Track (projectID, CID) -> set of validators who REPORTED that (projectID, CID) combination (denominator)
+	// This includes validators who saw submissions with that CID, regardless of which CID they chose
 	// Only track for winning CIDs
 	projectCIDValidators := make(map[string]map[string]bool) // key: "projectID:cid" -> set of validator IDs
 
@@ -93,41 +95,9 @@ func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBat
 	// Only track for winning CIDs
 	slotProjectCIDValidators := make(map[string]map[string]bool) // key: "slotID:projectID:cid" -> set of validator IDs
 
-	// First pass: identify validators who chose the winning CID for each project (denominator)
-	for _, batch := range batches {
-		validatorID := batch.SequencerId
-		if validatorID == "" {
-			continue
-		}
-
-		// Map projectID to CID from this batch's SnapshotCids array
-		projectToCID := make(map[string]string)
-		for i, projectID := range batch.ProjectIds {
-			if i < len(batch.SnapshotCids) {
-				projectToCID[projectID] = batch.SnapshotCids[i]
-			}
-		}
-
-		// Track which validators chose the winning CID for each project
-		for projectID, cid := range projectToCID {
-			if cid == "" {
-				continue
-			}
-			winningCID, isWinningProject := winningProjectCIDs[projectID]
-			if !isWinningProject || cid != winningCID {
-				continue
-			}
-
-			key := fmt.Sprintf("%s:%s", projectID, winningCID)
-			if projectCIDValidators[key] == nil {
-				projectCIDValidators[key] = make(map[string]bool)
-			}
-			projectCIDValidators[key][validatorID] = true
-		}
-	}
-
-	// Second pass: check ALL batches for submissions matching the winning CID
-	// This ensures we find submissions even if the validator chose a different CID
+	// Single pass: check ALL batches for submissions matching winning CIDs
+	// Track both: (1) which validators reported each (projectID, winningCID) combination, and
+	//             (2) which validators saw each (slotID, projectID, winningCID) combination
 	for _, batch := range batches {
 		validatorID := batch.SequencerId
 		if validatorID == "" {
@@ -145,6 +115,14 @@ func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBat
 			for _, submission := range submissions {
 				// If this submission matches the winning CID, track it
 				if submission.SnapshotCID == winningCID {
+					// Track denominator: validators who reported this (projectID, winningCID) combination
+					projectCIDKey := fmt.Sprintf("%s:%s", projectID, winningCID)
+					if projectCIDValidators[projectCIDKey] == nil {
+						projectCIDValidators[projectCIDKey] = make(map[string]bool)
+					}
+					projectCIDValidators[projectCIDKey][validatorID] = true
+
+					// Track numerator: validators who saw this (slotID, projectID, winningCID) combination
 					slotKey := fmt.Sprintf("%d:%s:%s", submission.SlotID, projectID, winningCID)
 					if slotProjectCIDValidators[slotKey] == nil {
 						slotProjectCIDValidators[slotKey] = make(map[string]bool)
@@ -186,11 +164,14 @@ func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBat
 		// Calculate majority threshold (>51% of validators who reported this project+CID)
 		denominator := len(denominatorValidators)
 		majorityThreshold := float64(denominator) * 0.51
-		majorityVotes := int(majorityThreshold) + 1 // Need more than 51%
+		// For >51%, we need at least ceil(threshold) votes
+		// Examples: denominator=1 -> ceil(0.51)=1, denominator=2 -> ceil(1.02)=2, denominator=3 -> ceil(1.53)=2
+		majorityVotes := int(math.Ceil(majorityThreshold))
 
 		// Check if slot has majority votes
 		numerator := len(slotValidators)
-		if numerator > majorityVotes {
+		// Use >= to handle edge cases (e.g., denominator=1 means 100% which is definitely >51%)
+		if numerator >= majorityVotes && numerator > 0 {
 			if slotProjects[slotID] == nil {
 				slotProjects[slotID] = make(map[string]bool)
 			}

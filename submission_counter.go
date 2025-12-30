@@ -20,19 +20,30 @@ func NewSubmissionCounter() *SubmissionCounter {
 
 // ExtractSubmissionCounts extracts slot ID counts from a finalized batch for a specific data market
 // Returns map[slotID]count for the given dataMarket
+// Count represents how many unique projects each slot submitted to (not total submission entries)
 func ExtractSubmissionCounts(batch *FinalizedBatch, dataMarket string) (map[uint64]int, error) {
-	counts := make(map[uint64]int)
+	// Track slot ID -> set of projects they submitted to
+	slotProjects := make(map[uint64]map[string]bool) // slotID -> set of projectIDs
 
-	// Iterate through SubmissionDetails and count submissions per slot
-	for _, submissions := range batch.SubmissionDetails {
+	// Iterate through SubmissionDetails and track which projects each slot submitted to
+	for projectID, submissions := range batch.SubmissionDetails {
 		for _, submission := range submissions {
 			slotID := submission.SlotID
-			counts[slotID]++
+			if slotProjects[slotID] == nil {
+				slotProjects[slotID] = make(map[string]bool)
+			}
+			slotProjects[slotID][projectID] = true
 		}
 	}
 
-	log.Printf("Extracted submission counts for dataMarket %s: %d slots",
-		dataMarket, len(counts))
+	// Convert to counts map: count = number of unique projects this slot submitted to
+	counts := make(map[uint64]int)
+	for slotID, projects := range slotProjects {
+		counts[slotID] = len(projects)
+	}
+
+	log.Printf("Extracted submission counts for dataMarket %s: %d slots (projects per slot: %v)",
+		dataMarket, len(counts), counts)
 
 	return counts, nil
 }
@@ -124,3 +135,4 @@ func getTotalSlots(counts map[string]map[uint64]int) int {
 	}
 	return total
 }
+

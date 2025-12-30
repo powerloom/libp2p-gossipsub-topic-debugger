@@ -85,16 +85,15 @@ func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBat
 		}
 	}
 
-	// Track (projectID, CID) -> set of validators who reported it (denominator)
+	// Track (projectID, CID) -> set of validators who chose that CID (denominator)
 	// Only track for winning CIDs
 	projectCIDValidators := make(map[string]map[string]bool) // key: "projectID:cid" -> set of validator IDs
 
-	// Track (slotID, projectID, CID) -> set of validators who reported it (numerator)
+	// Track (slotID, projectID, CID) -> set of validators who saw that submission (numerator)
 	// Only track for winning CIDs
 	slotProjectCIDValidators := make(map[string]map[string]bool) // key: "slotID:projectID:cid" -> set of validator IDs
 
-	// First pass: collect all (projectID, CID) combinations and which validators reported them
-	// Only process projects that have winning CIDs in the aggregated batch
+	// First pass: identify validators who chose the winning CID for each project (denominator)
 	for _, batch := range batches {
 		validatorID := batch.SequencerId
 		if validatorID == "" {
@@ -109,36 +108,48 @@ func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBat
 			}
 		}
 
-		// Track which (projectID, CID) combinations this validator reported
-		// Only track if this CID matches the winning CID for that project
+		// Track which validators chose the winning CID for each project
 		for projectID, cid := range projectToCID {
 			if cid == "" {
 				continue
 			}
-			// Only process if this CID matches the winning CID for this project
 			winningCID, isWinningProject := winningProjectCIDs[projectID]
 			if !isWinningProject || cid != winningCID {
 				continue
 			}
 
-			key := fmt.Sprintf("%s:%s", projectID, cid)
+			key := fmt.Sprintf("%s:%s", projectID, winningCID)
 			if projectCIDValidators[key] == nil {
 				projectCIDValidators[key] = make(map[string]bool)
 			}
 			projectCIDValidators[key][validatorID] = true
+		}
+	}
 
-			// Track which (slotID, projectID, CID) combinations this validator reported
-			// A slot is eligible if its submission appears in submission_details[projectID] with snapshotCID matching the winning CID
-			if submissions, ok := batch.SubmissionDetails[projectID]; ok {
-				for _, submission := range submissions {
-					// Only count submissions where the snapshotCID matches the winning CID for this project
-					if submission.SnapshotCID == winningCID {
-						slotKey := fmt.Sprintf("%d:%s:%s", submission.SlotID, projectID, winningCID)
-						if slotProjectCIDValidators[slotKey] == nil {
-							slotProjectCIDValidators[slotKey] = make(map[string]bool)
-						}
-						slotProjectCIDValidators[slotKey][validatorID] = true
+	// Second pass: check ALL batches for submissions matching the winning CID
+	// This ensures we find submissions even if the validator chose a different CID
+	for _, batch := range batches {
+		validatorID := batch.SequencerId
+		if validatorID == "" {
+			continue
+		}
+
+		// Check all submission_details for submissions matching winning CIDs
+		for projectID, submissions := range batch.SubmissionDetails {
+			winningCID, isWinningProject := winningProjectCIDs[projectID]
+			if !isWinningProject {
+				continue
+			}
+
+			// Check all submissions for this project
+			for _, submission := range submissions {
+				// If this submission matches the winning CID, track it
+				if submission.SnapshotCID == winningCID {
+					slotKey := fmt.Sprintf("%d:%s:%s", submission.SlotID, projectID, winningCID)
+					if slotProjectCIDValidators[slotKey] == nil {
+						slotProjectCIDValidators[slotKey] = make(map[string]bool)
 					}
+					slotProjectCIDValidators[slotKey][validatorID] = true
 				}
 			}
 		}

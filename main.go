@@ -379,7 +379,7 @@ func main() {
 		// Initialize contract updater
 		contractUpdater = contract.NewUpdater(contractClient)
 
-			// Set window close callback - triggers aggregation and tally dump
+		// Set window close callback - triggers aggregation and tally dump
 		// Note: dataMarket parameter comes from EpochReleased event, but we use configured value
 		windowManager.SetWindowCloseCallback(func(epochID uint64, dataMarket string) error {
 			// Use configured data market (Level 2 batches don't contain dataMarket info atm)
@@ -421,9 +421,17 @@ func main() {
 				return fmt.Errorf("failed to update eligible counts: %w", err)
 			}
 
+			// Extract validator batch CIDs
+			validatorBatchCIDs := make(map[string]string)
+			for _, batch := range agg.Batches {
+				if batch.SequencerId != "" && batch.BatchIPFSCID != "" {
+					validatorBatchCIDs[batch.SequencerId] = batch.BatchIPFSCID
+				}
+			}
+
 			// Generate tally dump for the specific data market that triggered the window close
 			eligibleNodesCount := submissionCounter.GetEligibleNodesCount(dataMarket)
-			if err := tallyDumper.Dump(epochID, dataMarket, slotCounts, eligibleNodesCount, agg.TotalValidators, agg.AggregatedProjects); err != nil {
+			if err := tallyDumper.Dump(epochID, dataMarket, slotCounts, eligibleNodesCount, agg.TotalValidators, agg.AggregatedProjects, validatorBatchCIDs); err != nil {
 				log.Printf("❌ Error generating tally dump: %v", err)
 			}
 

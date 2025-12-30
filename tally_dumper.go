@@ -22,7 +22,8 @@ type TallyDump struct {
 	SubmissionCounts   map[string]int    `json:"submission_counts"` // slotID -> count
 	EligibleNodesCount int               `json:"eligible_nodes_count"`
 	TotalValidators    int               `json:"total_validators"`
-	AggregatedProjects map[string]string `json:"aggregated_projects"` // projectID -> winning CID
+	AggregatedProjects map[string]string `json:"aggregated_projects"`  // projectID -> winning CID
+	ValidatorBatchCIDs map[string]string `json:"validator_batch_cids"` // validatorID -> batch_ipfs_cid
 }
 
 // TallyDumper handles generating and managing per-epoch tally dumps
@@ -101,7 +102,7 @@ func (td *TallyDumper) Initialize(ctx context.Context) error {
 }
 
 // Dump generates a tally dump for an epoch
-func (td *TallyDumper) Dump(epochID uint64, dataMarket string, counts map[uint64]int, eligibleNodesCount int, totalValidators int, aggregatedProjects map[string]string) error {
+func (td *TallyDumper) Dump(epochID uint64, dataMarket string, counts map[uint64]int, eligibleNodesCount int, totalValidators int, aggregatedProjects map[string]string, validatorBatchCIDs map[string]string) error {
 	if !td.enabled {
 		return nil
 	}
@@ -123,6 +124,7 @@ func (td *TallyDumper) Dump(epochID uint64, dataMarket string, counts map[uint64
 		EligibleNodesCount: eligibleNodesCount,
 		TotalValidators:    totalValidators,
 		AggregatedProjects: aggregatedProjects,
+		ValidatorBatchCIDs: validatorBatchCIDs,
 	}
 
 	// Marshal JSON for file output
@@ -140,8 +142,16 @@ func (td *TallyDumper) Dump(epochID uint64, dataMarket string, counts map[uint64
 	}
 
 	// Log summary instead of full JSON
-	log.Printf("📊 TALLY DUMP: epoch=%d, dataMarket=%s, slots=%d, eligibleNodes=%d, validators=%d → %s",
-		epochID, dataMarket, len(counts), eligibleNodesCount, totalValidators, filepath)
+	validatorInfo := ""
+	if len(validatorBatchCIDs) > 0 {
+		validatorList := make([]string, 0, len(validatorBatchCIDs))
+		for validatorID, batchCID := range validatorBatchCIDs {
+			validatorList = append(validatorList, fmt.Sprintf("%s:%s", validatorID, batchCID))
+		}
+		validatorInfo = fmt.Sprintf(", validatorBatches=%v", validatorList)
+	}
+	log.Printf("📊 TALLY DUMP: epoch=%d, dataMarket=%s, slots=%d, eligibleNodes=%d, validators=%d%s → %s",
+		epochID, dataMarket, len(counts), eligibleNodesCount, totalValidators, validatorInfo, filepath)
 
 	return nil
 }

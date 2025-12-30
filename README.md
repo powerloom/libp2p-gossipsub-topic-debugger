@@ -17,7 +17,9 @@ During the transition from centralized sequencer to decentralized sequencer-vali
 - **New System**: DSV nodes perform Level 2 aggregations and commit them via VPA (Validator Priority Assignment), but they don't update submission counts or end-of-day reward updates
 - **Transition Solution**: This utility independently joins the validator mesh, listens to finalized batches from all validators, aggregates them using consensus logic, and updates the protocol contract - bridging the gap during the transition
 
-**Note**: Currently, Level 2 finalized batches don't contain `dataMarket` information. This utility uses a single configured `DATA_MARKET_ADDRESS` from environment variables. DSV nodes should add `dataMarket` to Level 2 batches in the future.
+**Important Notes**:
+- **Level 1 vs Level 2 Batches**: The validator mesh (`/powerloom/finalized-batches/all`) only receives **Level 1 finalizations** (individual validator's local batches). Level 2 aggregated batches are created locally by each validator and are NOT broadcast back to the network. This utility performs its own Level 2 aggregation from the Level 1 batches it receives.
+- **Data Market Information**: Currently, Level 1 batches don't contain `dataMarket` information. This utility uses a single configured `DATA_MARKET_ADDRESS` from environment variables. DSV nodes should add `dataMarket` to Level 1 batches in the future.
 
 ## Architecture
 
@@ -61,9 +63,10 @@ Generate Tally Dump (JSON file + stdout)
 - Ensures all validators have completed their local processing
 
 **Phase 2 - Aggregation Window**:
-- Validators start broadcasting their Level 1 finalizations
-- The utility collects batches from all validators
-- After the window expires, it's safe to compute consensus
+- Validators start broadcasting their Level 1 finalizations (individual validator batches)
+- The utility collects Level 1 batches from all validators
+- After the window expires, the utility performs Level 2 aggregation (consensus) across all received Level 1 batches
+- Note: Each validator also performs Level 2 aggregation locally, but those aggregated batches are NOT broadcast
 
 ## Setup Instructions
 
@@ -133,7 +136,7 @@ export LEVEL1_FINALIZATION_DELAY_SECONDS=10  # Wait for DSV Level 1 aggregation
 export AGGREGATION_WINDOW_SECONDS=20         # Collect validator batches
 ```
 
-4. **Configure data market** (REQUIRED - Level 2 batches don't contain dataMarket info):
+4. **Configure data market** (REQUIRED - Level 1 batches don't contain dataMarket info):
 ```bash
 export DATA_MARKET_ADDRESS=0xYourDataMarketAddress
 ```
@@ -280,7 +283,7 @@ If `ENABLE_CONTRACT_UPDATES=true`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATA_MARKET_ADDRESS` | *required* | Single data market address (Level 2 batches don't contain this info) |
+| `DATA_MARKET_ADDRESS` | *required* | Single data market address (Level 1 batches don't contain this info) |
 | `POWERLOOM_RPC_URL` | *required* | Powerloom chain RPC URL for event monitoring |
 | `PROTOCOL_STATE_CONTRACT` | *required* | Protocol state contract address |
 | `EVENT_POLL_INTERVAL` | `12` | Poll interval in seconds |

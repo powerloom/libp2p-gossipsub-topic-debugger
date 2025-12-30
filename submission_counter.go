@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -20,8 +23,8 @@ func NewSubmissionCounter() *SubmissionCounter {
 
 // ExtractSubmissionCounts extracts slot ID counts from a finalized batch for a specific data market
 // Returns map[slotID]count for the given dataMarket
-// Count represents how many unique projects each slot submitted to with >51% validator votes
-// Only submissions with majority votes (>51% of validators) are counted
+// Count represents how many unique projects each slot submitted to
+// Note: This is used for aggregated batches (after consensus filtering to winning CIDs)
 func ExtractSubmissionCounts(batch *FinalizedBatch, dataMarket string) (map[uint64]int, error) {
 	totalValidators := batch.ValidatorCount
 	if totalValidators == 0 {
@@ -30,36 +33,168 @@ func ExtractSubmissionCounts(batch *FinalizedBatch, dataMarket string) (map[uint
 		totalValidators = 1
 	}
 
-	// Calculate majority threshold (>51%)
-	majorityThreshold := float64(totalValidators) * 0.51
-	majorityVotes := int(majorityThreshold) + 1 // Need more than 51%
-
-	// Track slot ID -> set of projects they submitted to with majority votes
+	// Track slot ID -> set of projects they submitted to
+	// We count all submissions that appear in the aggregated batch (winning CID),
+	// regardless of how many validators saw them, since they're already part of consensus
 	slotProjects := make(map[uint64]map[string]bool) // slotID -> set of projectIDs
 
 	// Iterate through SubmissionDetails and track which projects each slot submitted to
-	// Only count submissions where VoteCount > majorityThreshold
+	// All submissions in the aggregated batch are counted (they're part of winning CIDs)
 	for projectID, submissions := range batch.SubmissionDetails {
 		for _, submission := range submissions {
-			// Only count if this submission has majority votes (>51%)
-			if submission.VoteCount > majorityVotes {
-				slotID := submission.SlotID
-				if slotProjects[slotID] == nil {
-					slotProjects[slotID] = make(map[string]bool)
-				}
-				slotProjects[slotID][projectID] = true
+			// Count all submissions that appear in aggregated batch
+			// They're already part of the winning CID, so they're valid submissions
+			slotID := submission.SlotID
+			if slotProjects[slotID] == nil {
+				slotProjects[slotID] = make(map[string]bool)
 			}
+			slotProjects[slotID][projectID] = true
 		}
 	}
 
-	// Convert to counts map: count = number of unique projects this slot submitted to with majority votes
+	// Convert to counts map: count = number of unique projects this slot submitted to
 	counts := make(map[uint64]int)
 	for slotID, projects := range slotProjects {
 		counts[slotID] = len(projects)
 	}
 
-	log.Printf("Extracted submission counts for dataMarket %s: %d slots with majority votes (threshold: >%d/%d validators)",
-		dataMarket, len(counts), majorityVotes, totalValidators)
+	log.Printf("Extracted submission counts for dataMarket %s: %d slots (total validators: %d)",
+		dataMarket, len(counts), totalValidators)
+
+	return counts, nil
+}
+
+// ExtractSubmissionCountsFromBatches extracts slot ID counts from ALL Level 1 batches
+// Eligibility criteria: A slot is eligible for a project if:
+//  1. The winning CID for that project (from aggregated batch consensus) matches the slot's submission CID
+//  2. The slot's submission (slotID + snapshotCID) appears in submission_details[projectID] of at least one Level 1 batch
+//  3. The slot has >51% votes from validators who reported that (projectID, CID) combination
+//
+// Denominator: Number of validators that reported that (projectID, CID) combination
+// This ensures slots are only counted for projects where their CID won consensus
+func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBatch *FinalizedBatch, dataMarket string) (map[uint64]int, error) {
+	if len(batches) == 0 || aggregatedBatch == nil {
+		return make(map[uint64]int), nil
+	}
+
+	// Build map of winning (projectID -> CID) from aggregated batch
+	winningProjectCIDs := make(map[string]string)
+	for i, projectID := range aggregatedBatch.ProjectIds {
+		if i < len(aggregatedBatch.SnapshotCids) {
+			winningProjectCIDs[projectID] = aggregatedBatch.SnapshotCids[i]
+		}
+	}
+
+	// Track (projectID, CID) -> set of validators who reported it (denominator)
+	// Only track for winning CIDs
+	projectCIDValidators := make(map[string]map[string]bool) // key: "projectID:cid" -> set of validator IDs
+
+	// Track (slotID, projectID, CID) -> set of validators who reported it (numerator)
+	// Only track for winning CIDs
+	slotProjectCIDValidators := make(map[string]map[string]bool) // key: "slotID:projectID:cid" -> set of validator IDs
+
+	// First pass: collect all (projectID, CID) combinations and which validators reported them
+	// Only process projects that have winning CIDs in the aggregated batch
+	for _, batch := range batches {
+		validatorID := batch.SequencerId
+		if validatorID == "" {
+			continue
+		}
+
+		// Map projectID to CID from this batch's SnapshotCids array
+		projectToCID := make(map[string]string)
+		for i, projectID := range batch.ProjectIds {
+			if i < len(batch.SnapshotCids) {
+				projectToCID[projectID] = batch.SnapshotCids[i]
+			}
+		}
+
+		// Track which (projectID, CID) combinations this validator reported
+		// Only track if this CID matches the winning CID for that project
+		for projectID, cid := range projectToCID {
+			if cid == "" {
+				continue
+			}
+			// Only process if this CID matches the winning CID for this project
+			winningCID, isWinningProject := winningProjectCIDs[projectID]
+			if !isWinningProject || cid != winningCID {
+				continue
+			}
+
+			key := fmt.Sprintf("%s:%s", projectID, cid)
+			if projectCIDValidators[key] == nil {
+				projectCIDValidators[key] = make(map[string]bool)
+			}
+			projectCIDValidators[key][validatorID] = true
+
+			// Track which (slotID, projectID, CID) combinations this validator reported
+			// A slot is eligible if its submission appears in submission_details[projectID] with snapshotCID matching the winning CID
+			if submissions, ok := batch.SubmissionDetails[projectID]; ok {
+				for _, submission := range submissions {
+					// Only count submissions where the snapshotCID matches the winning CID for this project
+					if submission.SnapshotCID == winningCID {
+						slotKey := fmt.Sprintf("%d:%s:%s", submission.SlotID, projectID, winningCID)
+						if slotProjectCIDValidators[slotKey] == nil {
+							slotProjectCIDValidators[slotKey] = make(map[string]bool)
+						}
+						slotProjectCIDValidators[slotKey][validatorID] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Second pass: count eligible projects per slot
+	// A slot is eligible for a project if it has >51% votes from validators who reported that project+CID
+	slotProjects := make(map[uint64]map[string]bool) // slotID -> set of projectIDs
+
+	for slotKey, slotValidators := range slotProjectCIDValidators {
+		// Parse slotKey: "slotID:projectID:cid"
+		// Note: projectID may contain colons, so we need to parse carefully
+		// Format is: slotID (numeric) : projectID (may contain colons) : cid (last part)
+		parts := strings.Split(slotKey, ":")
+		if len(parts) < 3 {
+			continue
+		}
+		slotIDStr := parts[0]
+		cid := parts[len(parts)-1]
+		projectID := strings.Join(parts[1:len(parts)-1], ":") // Rejoin middle parts as projectID
+
+		slotID, err := strconv.ParseUint(slotIDStr, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		// Get denominator: validators who reported this (projectID, CID)
+		projectCIDKey := fmt.Sprintf("%s:%s", projectID, cid)
+		denominatorValidators, exists := projectCIDValidators[projectCIDKey]
+		if !exists || len(denominatorValidators) == 0 {
+			continue
+		}
+
+		// Calculate majority threshold (>51% of validators who reported this project+CID)
+		denominator := len(denominatorValidators)
+		majorityThreshold := float64(denominator) * 0.51
+		majorityVotes := int(majorityThreshold) + 1 // Need more than 51%
+
+		// Check if slot has majority votes
+		numerator := len(slotValidators)
+		if numerator > majorityVotes {
+			if slotProjects[slotID] == nil {
+				slotProjects[slotID] = make(map[string]bool)
+			}
+			slotProjects[slotID][projectID] = true
+		}
+	}
+
+	// Convert to counts map: count = number of unique projects this slot is eligible for
+	counts := make(map[uint64]int)
+	for slotID, projects := range slotProjects {
+		counts[slotID] = len(projects)
+	}
+
+	log.Printf("Extracted submission counts from %d Level 1 batches for dataMarket %s: %d eligible slots (winning projects: %d)",
+		len(batches), dataMarket, len(counts), len(winningProjectCIDs))
 
 	return counts, nil
 }
@@ -153,4 +288,3 @@ func getTotalSlots(counts map[string]map[uint64]int) int {
 	}
 	return total
 }
-

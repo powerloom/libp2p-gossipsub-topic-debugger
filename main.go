@@ -408,8 +408,9 @@ func main() {
 				return nil
 			}
 
-			// Extract submission counts for this data market
-			slotCounts, err := ExtractSubmissionCounts(agg.AggregatedBatch, dataMarket)
+			// Extract submission counts from ALL Level 1 batches using winning CIDs from aggregated batch
+			// A slot is eligible only if its submission CID matches the winning CID for that project
+			slotCounts, err := ExtractSubmissionCountsFromBatches(agg.Batches, agg.AggregatedBatch, dataMarket)
 			if err != nil {
 				return fmt.Errorf("failed to extract submission counts: %w", err)
 			}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 )
 
@@ -85,13 +86,60 @@ func ApplyConsensus(batches []*FinalizedBatch) *FinalizedBatch {
 			aggregated.ProjectVotes[projectID] = totalVotes
 		}
 
-		// Keep only submissions for winning CID
+		// Keep only submissions for winning CID and aggregate vote counts across validators
 		if submissions, ok := aggregated.SubmissionDetails[projectID]; ok {
-			filtered := make([]SubmissionMetadata, 0)
+			// Track unique submissions by slotID+CID and aggregate their vote counts
+			// Key: "slotID:cid" -> aggregated submission metadata
+			submissionMap := make(map[string]*SubmissionMetadata)
+			// Track which validators reported each submission
+			validatorSet := make(map[string]map[string]bool) // key: "slotID:cid" -> set of validator IDs
+			
 			for _, sub := range submissions {
 				if sub.SnapshotCID == cid {
-					filtered = append(filtered, sub)
+					key := fmt.Sprintf("%d:%s", sub.SlotID, sub.SnapshotCID)
+					
+					// Initialize validator set for this key if needed
+					if validatorSet[key] == nil {
+						validatorSet[key] = make(map[string]bool)
+					}
+					
+					// Add all validators that confirmed this submission
+					for _, v := range sub.ValidatorsConfirming {
+						validatorSet[key][v] = true
+					}
+					
+					// If we've seen this submission before, update the existing entry
+					if existing, exists := submissionMap[key]; exists {
+						// Update vote count to total unique validators
+						existing.VoteCount = len(validatorSet[key])
+						// Update validators list
+						existing.ValidatorsConfirming = make([]string, 0, len(validatorSet[key]))
+						for v := range validatorSet[key] {
+							existing.ValidatorsConfirming = append(existing.ValidatorsConfirming, v)
+						}
+					} else {
+						// First time seeing this submission - create new entry
+						submissionMap[key] = &SubmissionMetadata{
+							SubmitterID:          sub.SubmitterID,
+							SnapshotCID:          sub.SnapshotCID,
+							Timestamp:            sub.Timestamp,
+							Signature:            sub.Signature,
+							SlotID:               sub.SlotID,
+							VoteCount:            len(validatorSet[key]), // Count unique validators
+							ValidatorsConfirming: make([]string, 0, len(validatorSet[key])),
+						}
+						// Add all validators to the list
+						for v := range validatorSet[key] {
+							submissionMap[key].ValidatorsConfirming = append(submissionMap[key].ValidatorsConfirming, v)
+						}
+					}
 				}
+			}
+			
+			// Convert map to slice
+			filtered := make([]SubmissionMetadata, 0, len(submissionMap))
+			for _, sub := range submissionMap {
+				filtered = append(filtered, *sub)
 			}
 			aggregated.SubmissionDetails[projectID] = filtered
 		}

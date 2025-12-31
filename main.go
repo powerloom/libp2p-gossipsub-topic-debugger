@@ -430,8 +430,15 @@ func main() {
 				}
 			}
 
+			// Calculate eligible nodes count for THIS epoch only (slots with count > 0)
+			eligibleNodesCount := 0
+			for _, count := range slotCounts {
+				if count > 0 {
+					eligibleNodesCount++
+				}
+			}
+
 			// Generate tally dump for the specific data market that triggered the window close
-			eligibleNodesCount := submissionCounter.GetEligibleNodesCount(dataMarket)
 			if err := tallyDumper.Dump(epochID, dataMarket, slotCounts, eligibleNodesCount, agg.TotalValidators, agg.AggregatedProjects, validatorBatchCIDs); err != nil {
 				log.Printf("❌ Error generating tally dump: %v", err)
 			}

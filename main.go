@@ -597,11 +597,21 @@ func main() {
 					submissionCounter.ResetCountsForDay(dataMarket, marker.LastKnownDay)
 				}
 			} else {
-				// Periodic update (no eligibleNodesCount) - only if epoch matches update interval
-				if err := contractUpdater.UpdateSubmissionCounts(callCtx, epochID, dataMarket, slotCounts, 0); err != nil {
-					log.Printf("❌ Error updating contract for data market %s: %v", dataMarket, err)
+				// Periodic update - send accumulated counts for the current day (not per-epoch counts)
+				if currentDay != "" {
+					// Get accumulated counts for the current day from Redis
+					accumulatedDayCounts := submissionCounter.GetCountsForDay(dataMarket, currentDay)
+					if len(accumulatedDayCounts) > 0 {
+						if err := contractUpdater.UpdateSubmissionCounts(callCtx, epochID, dataMarket, accumulatedDayCounts, 0); err != nil {
+							log.Printf("❌ Error updating contract for data market %s: %v", dataMarket, err)
+						}
+						// Note: UpdateSubmissionCounts logs internally when skipping or successfully sending
+					} else {
+						log.Printf("⚠️  No accumulated counts found for day %s, skipping periodic update", currentDay)
+					}
+				} else {
+					log.Printf("⚠️  Current day not available, skipping periodic update for epoch %d", epochID)
 				}
-				// Note: UpdateSubmissionCounts logs internally when skipping or successfully sending
 			}
 
 			return nil

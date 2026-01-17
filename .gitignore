@@ -14,3 +14,9 @@ main
 
 # Binary output directory if using one
 bin/
+
+# Auto-generated docker-compose override (created by start.sh for production mode)
+docker-compose.override.yml
+
+# Cloned dependencies (development mode)
+relayer-py/

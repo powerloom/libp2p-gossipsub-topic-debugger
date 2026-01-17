@@ -79,25 +79,86 @@ Generate Tally Dump (JSON file + stdout)
 
 ### Docker Setup (Recommended)
 
+The docker-compose setup includes:
+- `p2p-debugger`: The main debugger service
+- `relayer-py`: Python-based transaction relayer for contract updates
+- `redis`: Required by relayer-py and p2p-debugger for state management
+- `rabbitmq`: Required by relayer-py for transaction queueing
+
+#### Setup Instructions
+
 1. **Configure environment variables**:
 ```bash
 cp .env.example .env
-# Edit .env with your configuration
+# Edit .env with your configuration:
+# - Set RELAYER_URL=http://relayer-py:8080 for docker-compose
+# - Configure VPA_SIGNER_ADDRESSES and VPA_SIGNER_PRIVATE_KEYS for relayer-py
+# - Set POWERLOOM_RPC_NODES (comma-separated list)
+# - Set DATA_MARKET_ADDRESS
+# - Set PROTOCOL_STATE_CONTRACT
+# - Set RELAYER_PY_IMAGE_TAG (defaults to "latest")
 ```
 
-2. **Build and start**:
-```bash
-./start.sh
-```
+2. **Start services** (automatically handles dev/production):
 
-3. **View logs**:
+   **Development (Build from Source)**:
+   ```bash
+   ./bootstrap.sh  # Clones relayer-py repository (optional - start.sh handles this)
+   ./start.sh      # Automatically detects relayer-py and builds from source
+   ```
+
+   **Production (Use Pre-built Image)**:
+   ```bash
+   ./start.sh  # Automatically detects missing relayer-py and uses pre-built image
+   ```
+
+   The `start.sh` script automatically:
+   - Checks if `./relayer-py` directory exists
+   - If exists: builds from source (development mode)
+   - If missing: creates override file and uses pre-built image (production mode)
+   - No manual configuration needed
+
+3. **Configure Trusted Updaters** (REQUIRED for contract updates):
+   - The signer addresses in `VPA_SIGNER_ADDRESSES` must be added to ProtocolState contract's `trustedUpdaters` mapping
+   - Call `ProtocolState.addTrustedUpdater(signerAddress)` from contract owner
+   - Verify: `ProtocolState.trustedUpdaters(signerAddress)` returns `true`
+   - See "Trusted Updaters Setup" section below for details
+
+**How it works**:
+- Docker-compose **merges** multiple compose files - it doesn't replace them
+- The main `docker-compose.yml` defines ALL sections: `image`, `build`, `environment`, `depends_on`, `networks`, `ports`, `volumes`, `healthcheck`, etc.
+- The override file (`docker-compose.override.yml`) only needs to specify what's different - docker-compose merges it with the base file
+- When `./relayer-py` doesn't exist: `start.sh` creates override with `build: null` to remove build section, keeping all other sections from base file
+- When `./relayer-py` exists: override file is removed, docker-compose builds from source using all sections from base file
+- **Key point**: The override file doesn't need to duplicate environment, depends_on, networks, etc. - those are automatically merged from the base file
+
+4. **View logs**:
 ```bash
+# All services
 docker-compose logs -f
+
+# Specific service
+docker-compose logs -f p2p-debugger
+docker-compose logs -f relayer-py
 ```
 
-4. **Stop**:
+5. **Check service health**:
+```bash
+# Check relayer-py health (from within Docker network)
+docker-compose exec relayer-py curl http://localhost:8080/health
+
+# Check Redis
+docker-compose exec redis redis-cli ping
+
+# Check RabbitMQ management UI
+# Open http://localhost:15672 (default: guest/guest)
+```
+
+6. **Stop**:
 ```bash
 ./stop.sh
+# Or manually:
+docker-compose down
 ```
 
 ### Manual Setup (Alternative)
@@ -160,15 +221,55 @@ export TALLY_RETENTION_DAYS=7          # Or keep last 7 days
 export ENABLE_CONTRACT_UPDATES=true
 export SUBMISSION_UPDATE_EPOCH_INTERVAL=10  # Update every 10 epochs
 
-# Choose update method: "relayer" or "direct"
+# Choose update method: "relayer" (recommended) or "direct"
 export CONTRACT_UPDATE_METHOD=relayer
-export RELAYER_URL=http://localhost:8080
+
+# For docker-compose: Use docker service name
+export RELAYER_URL=http://relayer-py:8080
+# For standalone: Use localhost
+# export RELAYER_URL=http://localhost:8080
+
 export RELAYER_AUTH_TOKEN=your_token_here
 
-# OR for direct calls:
+# Relayer-py configuration (for docker-compose)
+export POWERLOOM_RPC_NODES=https://your-rpc-node-1,https://your-rpc-node-2
+export VPA_SIGNER_ADDRESSES=0xYourSignerAddress1,0xYourSignerAddress2
+export VPA_SIGNER_PRIVATE_KEYS=your_private_key_1,your_private_key_2
+export AUTH_TOKEN=${RELAYER_AUTH_TOKEN}  # Same as RELAYER_AUTH_TOKEN
+
+# OR for direct calls (not recommended with docker-compose):
 export CONTRACT_UPDATE_METHOD=direct
-export PRIVATE_KEY=your_private_key_hex
+export EVM_PRIVATE_KEY=your_evm_private_key_hex
 ```
+
+### Trusted Updaters Setup
+
+Before enabling contract updates, you must configure trusted updaters on the ProtocolState contract:
+
+1. **Get signer addresses**: The addresses configured in `VPA_SIGNER_ADDRESSES` will be used to sign transactions
+
+2. **Add to ProtocolState contract**: Call from contract owner:
+```solidity
+ProtocolState.addTrustedUpdater(signerAddress)
+```
+
+3. **Verify**: Check that the address is trusted:
+```solidity
+ProtocolState.trustedUpdaters(signerAddress) // Should return true
+```
+
+4. **Multiple signers**: You can add multiple signers for load balancing:
+```bash
+# In .env
+VPA_SIGNER_ADDRESSES=0xSigner1,0xSigner2,0xSigner3
+VPA_SIGNER_PRIVATE_KEYS=key1,key2,key3
+```
+
+**Important Notes**:
+- Only addresses in `trustedUpdaters` can call `updateRewards`/`updateSubmissionCounts` functions
+- The relayer-py service uses these signers to submit transactions
+- Ensure signers have sufficient balance for gas fees
+- Signers must be added before enabling contract updates
 
 ### Bootstrap Peers
 
@@ -241,10 +342,21 @@ The `TallyDumper` generates per-epoch reports:
 If `ENABLE_CONTRACT_UPDATES=true`:
 
 - Checks if epoch matches update interval (default: every 10 epochs)
-- Fetches current day from protocol contract
-- Calls `updateRewards(dataMarket, slotIds[], submissionsList[], day, eligibleNodes)`
-- Supports both relayer HTTP requests and direct contract calls
+- Fetches current day from DataMarket contract using `dayCounter()` view function
+- Sends update requests to relayer-py service via HTTP POST
+- Relayer-py queues transactions and submits to ProtocolState contract
+- Supports both relayer HTTP requests (recommended) and direct contract calls
 - Implements exponential backoff retry logic
+
+**Day Fetching**:
+- Uses DataMarket contract's `dayCounter()` view function
+- Requires `POWERLOOM_RPC_URL` to be set (even when using relayer method)
+- Falls back to error if day fetch fails (no longer uses placeholder calculation)
+
+**Docker Compose Integration**:
+- When using docker-compose, `RELAYER_URL` should be `http://relayer-py:8080`
+- Relayer-py service runs alongside debugger in same docker network
+- Redis and RabbitMQ are automatically started as dependencies
 
 ## Configuration Reference
 
@@ -297,9 +409,25 @@ If `ENABLE_CONTRACT_UPDATES=true`:
 | `ENABLE_CONTRACT_UPDATES` | `false` | Enable/disable contract updates |
 | `SUBMISSION_UPDATE_EPOCH_INTERVAL` | `10` | Update every N epochs |
 | `CONTRACT_UPDATE_METHOD` | `relayer` | `relayer` or `direct` |
-| `RELAYER_URL` | *required if relayer* | Relayer service URL |
-| `RELAYER_AUTH_TOKEN` | *required if relayer* | Relayer auth token |
+| `RELAYER_URL` | `http://relayer-py:8080` | Relayer service URL (use docker service name for docker-compose, `http://localhost:8080` for standalone) |
+| `RELAYER_AUTH_TOKEN` | *required if relayer* | Relayer auth token (must match `AUTH_TOKEN` in relayer-py) |
 | `EVM_PRIVATE_KEY` | *required if direct* | EVM private key hex (secp256k1) for direct contract calls. Note: This is different from `PRIVATE_KEY` which is Ed25519 for libp2p peer identity. |
+| `POWERLOOM_RPC_URL` | *required* | RPC URL for day fetching from DataMarket contract (required even when using relayer method) |
+
+### Docker Compose Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_PORT` | `6379` | Redis port mapping |
+| `RABBITMQ_PORT` | `5672` | RabbitMQ AMQP port |
+| `RABBITMQ_MGMT_PORT` | `15672` | RabbitMQ management UI port |
+| `RABBITMQ_USER` | `guest` | RabbitMQ username |
+| `RABBITMQ_PASS` | `guest` | RabbitMQ password |
+| `POWERLOOM_RPC_NODES` | *required* | Comma-separated RPC node URLs for relayer-py |
+| `VPA_SIGNER_ADDRESSES` | *required* | Comma-separated signer addresses (must be in ProtocolState.trustedUpdaters) |
+| `VPA_SIGNER_PRIVATE_KEYS` | *required* | Comma-separated signer private keys (hex format, no 0x prefix) |
+| `ANCHOR_CHAIN_ID` | `11167` | Anchor chain ID (Powerloom default) |
+| `MIN_SIGNER_BALANCE_ETH` | `0` | Minimum signer balance check (0 = disabled for devnet) |
 
 ## Usage Examples
 
@@ -386,9 +514,22 @@ Files are automatically pruned based on retention policies.
 
 - Check `ENABLE_CONTRACT_UPDATES=true`
 - Verify update method configuration (relayer vs direct)
-- For relayer: check `RELAYER_URL` and `RELAYER_AUTH_TOKEN`
+- For relayer: 
+  - Check `RELAYER_URL` is correct (use `http://relayer-py:8080` for docker-compose)
+  - Verify `RELAYER_AUTH_TOKEN` matches `AUTH_TOKEN` in relayer-py
+  - Check relayer-py service is healthy: `docker-compose exec relayer-py curl http://localhost:8080/health`
+  - Verify signer addresses are in `ProtocolState.trustedUpdaters` mapping
 - For direct: verify `EVM_PRIVATE_KEY` (secp256k1) and RPC access. Note: This is different from `PRIVATE_KEY` (Ed25519) used for libp2p peer identity.
 - Check epoch interval matches (updates only every N epochs)
+- Verify `POWERLOOM_RPC_URL` is set (required for day fetching)
+
+### Day fetching failures
+
+- Ensure `POWERLOOM_RPC_URL` is set and accessible
+- Verify DataMarket contract address is correct
+- Check DataMarket ABI file exists at `contract/abi/DataMarket.json`
+- Verify RPC node can call view functions on the contract
+- Check logs for specific error messages from day fetching
 
 ## Development
 

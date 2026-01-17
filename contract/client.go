@@ -2,23 +2,27 @@ package contract
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
+	rpchelper "github.com/powerloom/go-rpc-helper"
 )
 
 // Client handles contract interactions
 type Client struct {
-	client              *ethclient.Client
+	rpcHelper           *rpchelper.RPCHelper
+	contractBackend     *rpchelper.ContractBackend
 	protocolContract    common.Address
+	dataMarketABI       string // DataMarket ABI JSON string
 	updateMethod        string // "direct" or "relayer"
-	rpcURL              string
 	relayerURL          string
 	relayerAuthToken    string
 	evmPrivateKey       string // EVM private key for direct contract calls (secp256k1)
@@ -41,7 +45,23 @@ func NewClient() (*Client, error) {
 		updateMethod = "relayer" // Default to relayer
 	}
 
-	rpcURL := os.Getenv("POWERLOOM_RPC_URL")
+	// Support both POWERLOOM_RPC_NODES (comma-separated) and POWERLOOM_RPC_URL (single, for backward compatibility)
+	rpcNodesStr := os.Getenv("POWERLOOM_RPC_NODES")
+	if rpcNodesStr == "" {
+		rpcNodesStr = os.Getenv("POWERLOOM_RPC_URL") // Fallback to single URL
+	}
+
+	var rpcURLs []string
+	if rpcNodesStr != "" {
+		// Parse comma-separated list
+		for _, url := range strings.Split(rpcNodesStr, ",") {
+			url = strings.TrimSpace(url)
+			if url != "" {
+				rpcURLs = append(rpcURLs, url)
+			}
+		}
+	}
+
 	relayerURL := os.Getenv("RELAYER_URL")
 	relayerAuthToken := os.Getenv("RELAYER_AUTH_TOKEN")
 	evmPrivateKey := os.Getenv("EVM_PRIVATE_KEY") // EVM private key for direct contract calls
@@ -52,6 +72,12 @@ func NewClient() (*Client, error) {
 	}
 	protocolContract := common.HexToAddress(protocolContractStr)
 
+	// Load DataMarket ABI for day fetching
+	dataMarketABI, err := loadDataMarketABI()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load DataMarket ABI: %w", err)
+	}
+
 	updateInterval := int64(10) // Default 10 epochs
 	if intervalStr := os.Getenv("SUBMISSION_UPDATE_EPOCH_INTERVAL"); intervalStr != "" {
 		if interval, err := strconv.ParseInt(intervalStr, 10, 64); err == nil {
@@ -61,45 +87,164 @@ func NewClient() (*Client, error) {
 
 	client := &Client{
 		protocolContract:    protocolContract,
+		dataMarketABI:       dataMarketABI,
 		updateMethod:        updateMethod,
-		rpcURL:              rpcURL,
 		relayerURL:          relayerURL,
 		relayerAuthToken:    relayerAuthToken,
 		evmPrivateKey:       evmPrivateKey,
 		updateEpochInterval: updateInterval,
 	}
 
+	// Initialize RPC helper with multiple nodes (needed for day fetching even with relayer method)
+	if len(rpcURLs) > 0 {
+		// Build RPC config similar to protocl-state-cacher
+		rpcConfig := &rpchelper.RPCConfig{
+			Nodes: func() []rpchelper.NodeConfig {
+				var nodes []rpchelper.NodeConfig
+				for _, url := range rpcURLs {
+					nodes = append(nodes, rpchelper.NodeConfig{URL: url})
+				}
+				return nodes
+			}(),
+			MaxRetries:     5,
+			RetryDelay:     200 * time.Millisecond,
+			MaxRetryDelay:  5 * time.Second,
+			RequestTimeout: 30 * time.Second,
+		}
+
+		client.rpcHelper = rpchelper.NewRPCHelper(rpcConfig)
+
+		// Initialize the RPC helper
+		initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := client.rpcHelper.Initialize(initCtx); err != nil {
+			return nil, fmt.Errorf("failed to initialize RPC helper: %w", err)
+		}
+
+		// Create ContractBackend that uses the RPC helper for all contract calls
+		client.contractBackend = client.rpcHelper.NewContractBackend()
+	}
+
 	// Initialize ethclient if using direct method
 	if updateMethod == "direct" {
-		if rpcURL == "" {
-			return nil, fmt.Errorf("POWERLOOM_RPC_URL is required when CONTRACT_UPDATE_METHOD=direct")
+		if len(rpcURLs) == 0 {
+			return nil, fmt.Errorf("POWERLOOM_RPC_NODES or POWERLOOM_RPC_URL is required when CONTRACT_UPDATE_METHOD=direct")
 		}
 		if evmPrivateKey == "" {
 			return nil, fmt.Errorf("EVM_PRIVATE_KEY is required when CONTRACT_UPDATE_METHOD=direct")
 		}
-
-		ethClient, err := ethclient.Dial(rpcURL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to RPC: %w", err)
-		}
-		client.client = ethClient
 	}
 
 	return client, nil
 }
 
-// FetchCurrentDay fetches the current day for a data market from the protocol contract
-func (c *Client) FetchCurrentDay(ctx context.Context, dataMarketAddress common.Address) (*big.Int, error) {
-	if c.updateMethod == "direct" && c.client != nil {
-		// Call contract method to get current day
-		// This would require the contract ABI - for now, return error
-		// In production, this would be: c.protocolContract.DayCounter(&bind.CallOpts{Context: ctx}, dataMarketAddress)
-		return nil, fmt.Errorf("direct contract calls not fully implemented - use relayer method")
+// loadDataMarketABI loads the DataMarket ABI from the embedded file
+func loadDataMarketABI() (string, error) {
+	// Read ABI file
+	abiPath := "contract/abi/DataMarket.json"
+	if _, err := os.Stat(abiPath); os.IsNotExist(err) {
+		// Try alternative path
+		abiPath = "./contract/abi/DataMarket.json"
+		if _, err := os.Stat(abiPath); os.IsNotExist(err) {
+			return "", fmt.Errorf("DataMarket ABI file not found at contract/abi/DataMarket.json")
+		}
 	}
 
-	// For relayer method, we'd need to query via API or cache
-	// For now, return error indicating this needs to be implemented
-	return nil, fmt.Errorf("FetchCurrentDay not implemented for relayer method - needs API endpoint")
+	abiBytes, err := os.ReadFile(abiPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read DataMarket ABI file: %w", err)
+	}
+
+	// Parse JSON to extract ABI array
+	var artifact struct {
+		ABI json.RawMessage `json:"abi"`
+	}
+	if err := json.Unmarshal(abiBytes, &artifact); err != nil {
+		return "", fmt.Errorf("failed to parse DataMarket ABI JSON: %w", err)
+	}
+
+	return string(artifact.ABI), nil
+}
+
+// FetchCurrentDay fetches the current day for a data market from the DataMarket contract
+// Uses RPC helper with automatic failover across multiple nodes
+func (c *Client) FetchCurrentDay(ctx context.Context, dataMarketAddress common.Address) (*big.Int, error) {
+	if c.contractBackend == nil {
+		return nil, fmt.Errorf("RPC helper not initialized - POWERLOOM_RPC_NODES or POWERLOOM_RPC_URL is required for day fetching")
+	}
+
+	// Parse ABI
+	parsedABI, err := parseABI(c.dataMarketABI)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse DataMarket ABI: %w", err)
+	}
+
+	// Create contract binding using ContractBackend (handles failover automatically)
+	contract := bind.NewBoundContract(dataMarketAddress, parsedABI, c.contractBackend, c.contractBackend, nil)
+
+	// Call dayCounter() view function
+	var result []interface{}
+	callOpts := c.GetCallOpts(ctx)
+	err = contract.Call(callOpts, &result, "dayCounter")
+	if err != nil {
+		return nil, fmt.Errorf("failed to call dayCounter on DataMarket contract %s: %w", dataMarketAddress.Hex(), err)
+	}
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("dayCounter returned no result")
+	}
+
+	day, ok := result[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("dayCounter returned unexpected type: %T", result[0])
+	}
+
+	return day, nil
+}
+
+// FetchDailySnapshotQuota fetches the daily snapshot quota for a data market from the DataMarket contract
+func (c *Client) FetchDailySnapshotQuota(ctx context.Context, dataMarketAddress common.Address) (*big.Int, error) {
+	if c.contractBackend == nil {
+		return nil, fmt.Errorf("RPC helper not initialized - POWERLOOM_RPC_NODES or POWERLOOM_RPC_URL is required")
+	}
+
+	// Parse ABI
+	parsedABI, err := parseABI(c.dataMarketABI)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse DataMarket ABI: %w", err)
+	}
+
+	// Create contract binding
+	contract := bind.NewBoundContract(dataMarketAddress, parsedABI, c.contractBackend, c.contractBackend, nil)
+
+	// Call dailySnapshotQuota() view function
+	var result []interface{}
+	callOpts := c.GetCallOpts(ctx)
+	err = contract.Call(callOpts, &result, "dailySnapshotQuota")
+	if err != nil {
+		return nil, fmt.Errorf("failed to call dailySnapshotQuota on DataMarket contract %s: %w", dataMarketAddress.Hex(), err)
+	}
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("dailySnapshotQuota returned no result")
+	}
+
+	quota, ok := result[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("dailySnapshotQuota returned unexpected type: %T", result[0])
+	}
+
+	return quota, nil
+}
+
+// parseABI parses the ABI JSON string into an ABI object
+func parseABI(abiJSON string) (abi.ABI, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(abiJSON))
+	if err != nil {
+		return abi.ABI{}, fmt.Errorf("failed to parse ABI JSON: %w", err)
+	}
+	return parsedABI, nil
 }
 
 // ShouldUpdate checks if we should update for this epoch
@@ -115,18 +260,19 @@ func (c *Client) GetUpdateMethod() string {
 	return c.updateMethod
 }
 
-// Close closes the client connection
+// Close closes RPC helper connections
 func (c *Client) Close() {
-	if c.client != nil {
-		c.client.Close()
+	if c.rpcHelper != nil {
+		// RPC helper manages its own connections, no explicit close needed
+		// but we can clean up if needed
 	}
 }
 
 // GetCallOpts returns call options for contract calls
+// Note: The context passed in should already have appropriate timeout/cancellation
+// This function does not add additional timeout to avoid double-wrapping contexts
 func (c *Client) GetCallOpts(ctx context.Context) *bind.CallOpts {
-	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel() // Ensure context is cancelled to avoid leak
 	return &bind.CallOpts{
-		Context: callCtx,
+		Context: ctx,
 	}
 }

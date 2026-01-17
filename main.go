@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -23,9 +24,11 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
+	rpchelper "github.com/powerloom/go-rpc-helper"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/gossipconfig"
 
 	contract "p2p-debugger/contract"
+	"p2p-debugger/redis"
 )
 
 // P2PSnapshotSubmission represents the data structure for snapshot submissions
@@ -218,6 +221,17 @@ func main() {
 
 	ctx := context.Background()
 
+	// Initialize Redis client for submission count persistence
+	redisClient, err := redis.NewRedisClient()
+	if err != nil {
+		log.Printf("⚠️ Failed to initialize Redis client: %v. Submission counts will only be stored in memory.", err)
+		log.Printf("⚠️ This means counts will be lost on restart. For production, ensure Redis is available.")
+	} else {
+		redis.RedisClient = redisClient
+		log.Printf("✅ Redis client initialized successfully")
+		defer redisClient.Close()
+	}
+
 	// Configure connection manager for testing/debugging
 	connLowWater := getEnvAsInt("CONN_MANAGER_LOW_WATER", 20)
 	connHighWater := getEnvAsInt("CONN_MANAGER_HIGH_WATER", 100)
@@ -335,9 +349,11 @@ func main() {
 	var submissionCounter *SubmissionCounter
 	var contractClient *contract.Client
 	var contractUpdater *contract.Updater
+	var quotaCache *QuotaCache
 	var windowManager *WindowManager
 	var eventMonitor *EventMonitor
 	var tallyDumper *TallyDumper
+	var dayTransitionManager *DayTransitionManager
 
 	if validatorMeshMode {
 		// Get configured data market address (REQUIRED)
@@ -351,6 +367,9 @@ func main() {
 		// Initialize window manager
 		windowManager = NewWindowManager(ctx)
 
+		// Initialize day transition manager
+		dayTransitionManager = NewDayTransitionManager(ctx)
+
 		// Initialize tally dumper
 		tallyDumper = NewTallyDumper()
 		if err := tallyDumper.Initialize(ctx); err != nil {
@@ -360,14 +379,15 @@ func main() {
 		// Initialize batch processor with window manager
 		batchProcessor = NewBatchProcessor(ctx, windowManager)
 
-		// Set data market extractor to always return configured data market
+		// Set data market extractor to return configured data market (for window lookups)
+		// Windows are stored using configured/new addresses, not legacy event monitor addresses
 		// (Level 2 batches don't contain dataMarket info atm)
 		batchProcessor.SetDataMarketExtractor(func(batch *FinalizedBatch) string {
 			return configuredDataMarket
 		})
 
-		// Initialize submission counter
-		submissionCounter = NewSubmissionCounter()
+		// Initialize submission counter (with Redis persistence)
+		submissionCounter = NewSubmissionCounter(ctx)
 
 		// Initialize contract client (may be disabled)
 		contractClient, err = contract.NewClient()
@@ -379,12 +399,23 @@ func main() {
 		// Initialize contract updater
 		contractUpdater = contract.NewUpdater(contractClient)
 
+		// Initialize quota cache (for dailySnapshotQuota)
+		quotaCache = NewQuotaCache(ctx, contractClient)
+		// Load quota from Redis on startup
+		if configuredDataMarket != "" {
+			quotaCache.LoadFromRedis([]string{configuredDataMarket})
+		}
+
 		// Set window close callback - triggers aggregation and tally dump
 		// Note: dataMarket parameter comes from EpochReleased event, but we use configured value
 		windowManager.SetWindowCloseCallback(func(epochID uint64, dataMarket string) error {
 			// Use configured data market (Level 2 batches don't contain dataMarket info atm)
 			dataMarket = configuredDataMarket
 			log.Printf("🔒 Window closed for epoch %d, dataMarket %s - finalizing tally", epochID, dataMarket)
+
+			// Create a new context with timeout for contract calls (window close callback runs in goroutine)
+			callCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 
 			// Get aggregation state before aggregating
 			agg := batchProcessor.GetEpochAggregation(epochID)
@@ -417,9 +448,27 @@ func main() {
 
 			log.Printf("📈 Extracted %d unique slot IDs for epoch %d", len(slotCounts), epochID)
 
-			// Update submission counter
-			if err := submissionCounter.UpdateEligibleCounts(epochID, dataMarket, slotCounts); err != nil {
-				return fmt.Errorf("failed to update eligible counts: %w", err)
+			// Fetch current day for tracking counts per day
+			currentDay := ""
+			if contractClient != nil {
+				day, err := contractClient.FetchCurrentDay(callCtx, common.HexToAddress(dataMarket))
+				if err != nil {
+					log.Printf("⚠️  Could not fetch current day for count tracking: %v", err)
+				} else {
+					currentDay = day.String()
+				}
+			}
+
+			// Update submission counter with day tracking
+			if currentDay != "" {
+				if err := submissionCounter.UpdateEligibleCountsForDay(epochID, dataMarket, currentDay, slotCounts); err != nil {
+					return fmt.Errorf("failed to update eligible counts: %w", err)
+				}
+			} else {
+				// Fallback: update without day tracking
+				if err := submissionCounter.UpdateEligibleCounts(epochID, dataMarket, slotCounts); err != nil {
+					return fmt.Errorf("failed to update eligible counts: %w", err)
+				}
 			}
 
 			// Extract validator batch CIDs
@@ -443,41 +492,160 @@ func main() {
 				log.Printf("❌ Error generating tally dump: %v", err)
 			}
 
-			// Update contract for this data market (if enabled)
-			if err := contractUpdater.UpdateSubmissionCounts(ctx, epochID, dataMarket, slotCounts, eligibleNodesCount); err != nil {
-				log.Printf("❌ Error updating contract for data market %s: %v", dataMarket, err)
+			// Fetch current day for day transition checking (if not already fetched)
+			if currentDay == "" && contractClient != nil {
+				day, err := contractClient.FetchCurrentDay(callCtx, common.HexToAddress(dataMarket))
+				if err != nil {
+					log.Printf("⚠️  Could not fetch current day for day transition check: %v", err)
+				} else {
+					currentDay = day.String()
+					log.Printf("📅 Current day for data market %s: %s (epoch %d)", dataMarket, currentDay, epochID)
+				}
+			}
+
+			// Check for day transition
+			if currentDay != "" {
+				dayTransitionManager.CheckDayTransition(dataMarket, currentDay, epochID)
+			}
+
+			// Update quota cache for this epoch (queries contract periodically)
+			if quotaCache != nil {
+				if err := quotaCache.UpdateQuotaForEpochWithContext(callCtx, dataMarket, epochID); err != nil {
+					log.Printf("⚠️ Failed to update quota cache for epoch %d: %v", epochID, err)
+				}
+			}
+
+			// Check if contract updater is initialized
+			if contractUpdater == nil {
+				log.Printf("⚠️  Contract updater not initialized (ENABLE_CONTRACT_UPDATES may be false) - skipping contract updates for epoch %d", epochID)
+				return nil
+			}
+
+			// Check if this is a buffer epoch (final update for previous day)
+			if marker, isBufferEpoch := dayTransitionManager.IsBufferEpoch(dataMarket, epochID); isBufferEpoch {
+				log.Printf("🎯 Buffer epoch reached for data market %s: epoch %d (previous day: %s)",
+					dataMarket, epochID, marker.LastKnownDay)
+
+				// Get daily snapshot quota from cache (in-memory or Redis)
+				dailySnapshotQuota := 0
+				if quotaCache != nil {
+					quota, err := quotaCache.GetQuotaWithContext(callCtx, dataMarket)
+					if err != nil {
+						log.Printf("⚠️ Failed to get dailySnapshotQuota for data market %s: %v. Using count > 0 as fallback.", dataMarket, err)
+					} else {
+						dailySnapshotQuota = int(quota.Int64())
+						log.Printf("📊 Daily snapshot quota for data market %s: %d", dataMarket, dailySnapshotQuota)
+					}
+				}
+
+				// Send final update for previous day with eligibleNodesCount
+				// Get submission counts for the previous day (from Redis)
+				prevDaySlotCounts := submissionCounter.GetCountsForDay(dataMarket, marker.LastKnownDay)
+				// Get eligible nodes count (slots with count >= dailySnapshotQuota)
+				prevDayEligibleNodes := submissionCounter.GetEligibleNodesCountForDay(dataMarket, marker.LastKnownDay, dailySnapshotQuota)
+
+				if err := contractUpdater.UpdateFinalRewards(callCtx, epochID, dataMarket, marker.LastKnownDay, prevDaySlotCounts, prevDayEligibleNodes); err != nil {
+					log.Printf("❌ Error sending final rewards update for data market %s, day %s: %v", dataMarket, marker.LastKnownDay, err)
+				} else {
+					log.Printf("✅ Successfully sent final rewards update for data market %s, day %s (eligibleNodes=%d)",
+						dataMarket, marker.LastKnownDay, prevDayEligibleNodes)
+					// Remove marker after successful update
+					dayTransitionManager.RemoveMarker(dataMarket, marker.CurrentEpoch)
+					// Optionally reset counts for the previous day after final update
+					submissionCounter.ResetCountsForDay(dataMarket, marker.LastKnownDay)
+				}
+			} else {
+				// Periodic update (no eligibleNodesCount) - only if epoch matches update interval
+				if err := contractUpdater.UpdateSubmissionCounts(callCtx, epochID, dataMarket, slotCounts, 0); err != nil {
+					log.Printf("❌ Error updating contract for data market %s: %v", dataMarket, err)
+				}
+				// Note: UpdateSubmissionCounts logs internally when skipping or successfully sending
 			}
 
 			return nil
 		})
 
-		// Initialize event monitor if RPC URL is provided
-		rpcURL := os.Getenv("POWERLOOM_RPC_URL")
-		protocolContract := os.Getenv("PROTOCOL_STATE_CONTRACT")
-
-		// Filter events by configured data market only
-		dataMarketsFilter := []string{configuredDataMarket}
-
-		if rpcURL != "" && protocolContract != "" {
-			eventMonitor, err = NewEventMonitor(ctx, rpcURL, protocolContract, dataMarketsFilter)
-			if err != nil {
-				log.Fatalf("Failed to initialize event monitor: %v", err)
-			}
-			defer eventMonitor.Close()
-
-			// Set event callback
-			eventMonitor.SetEventCallback(func(event *EpochReleasedEvent) error {
-				return windowManager.OnEpochReleased(event)
-			})
-
-			// Start event monitoring
-			if err := eventMonitor.Start(); err != nil {
-				log.Fatalf("Failed to start event monitor: %v", err)
-			}
-
-			log.Printf("Started event monitoring for protocol contract %s", protocolContract)
+		// Initialize event monitor if RPC nodes are provided
+		rpcNodesStr := os.Getenv("POWERLOOM_RPC_NODES")
+		if rpcNodesStr == "" {
+			log.Printf("Event monitoring disabled (POWERLOOM_RPC_NODES not set)")
 		} else {
-			log.Printf("Event monitoring disabled (POWERLOOM_RPC_URL or PROTOCOL_STATE_CONTRACT not set)")
+			nodes := strings.Split(rpcNodesStr, ",")
+			if len(nodes) == 0 {
+				log.Printf("Event monitoring disabled (POWERLOOM_RPC_NODES is empty)")
+			} else {
+				// Get event monitoring addresses (can be different from submission update addresses)
+				// Fallback to main addresses if event monitor addresses not set
+				eventProtocolContract := os.Getenv("EVENT_MONITOR_PROTOCOL_STATE_CONTRACT")
+				if eventProtocolContract == "" {
+					eventProtocolContract = os.Getenv("PROTOCOL_STATE_CONTRACT")
+				}
+
+				eventDataMarket := os.Getenv("EVENT_MONITOR_DATA_MARKET_ADDRESS")
+				if eventDataMarket == "" {
+					eventDataMarket = configuredDataMarket
+				}
+
+				if eventProtocolContract == "" {
+					log.Printf("Event monitoring disabled (EVENT_MONITOR_PROTOCOL_STATE_CONTRACT and PROTOCOL_STATE_CONTRACT not set)")
+				} else {
+					// Build RPC config for event monitoring
+					rpcConfig := &rpchelper.RPCConfig{
+						Nodes: func() []rpchelper.NodeConfig {
+							var nodeConfigs []rpchelper.NodeConfig
+							for _, url := range nodes {
+								url = strings.TrimSpace(url)
+								if url != "" {
+									nodeConfigs = append(nodeConfigs, rpchelper.NodeConfig{URL: url})
+								}
+							}
+							return nodeConfigs
+						}(),
+						MaxRetries:     5,
+						RetryDelay:     200 * time.Millisecond,
+						MaxRetryDelay:  5 * time.Second,
+						RequestTimeout: 30 * time.Second,
+					}
+
+					eventRpcHelper := rpchelper.NewRPCHelper(rpcConfig)
+					initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					if err := eventRpcHelper.Initialize(initCtx); err != nil {
+						cancel()
+						log.Fatalf("Failed to initialize RPC helper for event monitoring: %v", err)
+					}
+					cancel()
+
+					// Filter events by event monitoring data market
+					dataMarketsFilter := []string{eventDataMarket}
+
+					log.Printf("Event monitoring: protocolState=%s, dataMarket=%s", eventProtocolContract, eventDataMarket)
+					log.Printf("Submission updates: protocolState=%s, dataMarket=%s", os.Getenv("PROTOCOL_STATE_CONTRACT"), configuredDataMarket)
+
+					eventMonitor, err = NewEventMonitor(ctx, eventRpcHelper, eventProtocolContract, dataMarketsFilter)
+					if err != nil {
+						log.Fatalf("Failed to initialize event monitor: %v", err)
+					}
+					defer eventMonitor.Close()
+
+					// Set event callback
+					// IMPORTANT: Monitor events from legacy contracts, but create windows using NEW addresses
+					// This ensures windows are stored with correct addresses for future migration
+					eventMonitor.SetEventCallback(func(event *EpochReleasedEvent) error {
+						// Create a modified event with NEW data market address for window creation
+						// The event came from legacy contract, but window should use new address
+						modifiedEvent := *event
+						modifiedEvent.DataMarketAddress = common.HexToAddress(configuredDataMarket)
+						return windowManager.OnEpochReleased(&modifiedEvent)
+					})
+
+					// Start event monitoring
+					if err := eventMonitor.Start(); err != nil {
+						log.Fatalf("Failed to start event monitor: %v", err)
+					}
+
+					log.Printf("Started event monitoring for protocol contract %s", eventProtocolContract)
+				}
+			}
 		}
 
 		log.Printf("Initialized validator mesh components")

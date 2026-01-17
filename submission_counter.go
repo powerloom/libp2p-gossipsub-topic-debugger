@@ -1,24 +1,30 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
 	"strconv"
 	"strings"
 	"sync"
+
+	"p2p-debugger/redis"
 )
 
-// SubmissionCounter tracks eligible submission counts per slot and data market
+// SubmissionCounter tracks eligible submission counts per slot, data market, and day
+// Counts are persisted to Redis for epoch-over-epoch persistence
 type SubmissionCounter struct {
-	counts map[string]map[uint64]int // dataMarketAddress -> slotID -> count
+	counts map[string]map[string]map[uint64]int // dataMarketAddress -> day -> slotID -> count
 	mu     sync.RWMutex
+	ctx    context.Context
 }
 
 // NewSubmissionCounter creates a new submission counter
-func NewSubmissionCounter() *SubmissionCounter {
+func NewSubmissionCounter(ctx context.Context) *SubmissionCounter {
 	return &SubmissionCounter{
-		counts: make(map[string]map[uint64]int),
+		counts: make(map[string]map[string]map[uint64]int),
+		ctx:    ctx,
 	}
 }
 
@@ -191,53 +197,164 @@ func ExtractSubmissionCountsFromBatches(batches []*FinalizedBatch, aggregatedBat
 	return counts, nil
 }
 
-// UpdateEligibleCounts updates the internal tracking of eligible counts for a specific data market
+// UpdateEligibleCounts updates the internal tracking of eligible counts for a specific data market and day
 func (sc *SubmissionCounter) UpdateEligibleCounts(epochID uint64, dataMarket string, slotCounts map[uint64]int) error {
+	return sc.UpdateEligibleCountsForDay(epochID, dataMarket, "", slotCounts)
+}
+
+// UpdateEligibleCountsForDay updates the internal tracking of eligible counts for a specific data market and day
+// Persists counts to Redis for epoch-over-epoch persistence
+func (sc *SubmissionCounter) UpdateEligibleCountsForDay(epochID uint64, dataMarket string, day string, slotCounts map[uint64]int) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
 	if sc.counts[dataMarket] == nil {
-		sc.counts[dataMarket] = make(map[uint64]int)
+		sc.counts[dataMarket] = make(map[string]map[uint64]int)
 	}
 
+	if sc.counts[dataMarket][day] == nil {
+		sc.counts[dataMarket][day] = make(map[uint64]int)
+	}
+
+	// Update in-memory counts and persist to Redis
 	for slotID, count := range slotCounts {
-		// Accumulate counts (or replace, depending on requirements)
-		sc.counts[dataMarket][slotID] += count
+		// Accumulate counts per day in memory
+		sc.counts[dataMarket][day][slotID] += count
+
+		// Persist to Redis: increment slot submission count by the actual count value
+		// count represents the number of unique projects this slot submitted to in this epoch
+		slotIDStr := strconv.FormatUint(slotID, 10)
+		key := redis.SlotSubmissionKey(dataMarket, slotIDStr, day)
+
+		// Increment Redis counter by the actual count value (not just 1)
+		newCount, err := redis.IncrBy(sc.ctx, key, int64(count))
+		if err != nil {
+			log.Printf("⚠️ Failed to persist submission count to Redis for slot %d, dataMarket %s, day %s: %v", slotID, dataMarket, day, err)
+			// Continue with in-memory update even if Redis fails
+			// Use in-memory count as fallback
+			newCount = int64(sc.counts[dataMarket][day][slotID])
+		} else {
+			log.Printf("📈 Redis: Slot %d submission count incremented by %d for dataMarket %s, day %s: new total = %d", slotID, count, dataMarket, day, newCount)
+		}
+
+		// Also update EligibleSlotSubmissionKey with same value (submissions are already eligible)
+		eligibleKey := redis.EligibleSlotSubmissionKey(dataMarket, slotIDStr, day)
+		if err := redis.Set(sc.ctx, eligibleKey, strconv.FormatInt(newCount, 10)); err != nil {
+			log.Printf("⚠️ Failed to update EligibleSlotSubmissionKey for slot %d, dataMarket %s, day %s: %v", slotID, dataMarket, day, err)
+		}
+
+		// Also track in eligible slot submissions hash by epoch (for final rewards calculation)
+		epochIDStr := strconv.FormatUint(epochID, 10)
+		epochKey := redis.EligibleSlotSubmissionsByEpochKey(dataMarket, day, epochIDStr)
+		if err := redis.HSet(sc.ctx, epochKey, slotIDStr, strconv.FormatInt(newCount, 10)); err != nil {
+			log.Printf("⚠️ Failed to persist epoch submission count to Redis for slot %d, epoch %d: %v", slotID, epochID, err)
+		}
+
+		// Track eligible nodes set (slots with >0 submissions)
+		// Note: Final eligibility (>= quota) is checked at final rewards time
+		// We add all slots with submissions here, but GetEligibleNodesCountForDay filters by quota
+		if newCount > 0 {
+			eligibleNodesKey := redis.EligibleNodesByDayKey(dataMarket, day)
+			if err := redis.SAdd(sc.ctx, eligibleNodesKey, slotIDStr); err != nil {
+				log.Printf("⚠️ Failed to add slot %d to eligible nodes set: %v", slotID, err)
+			}
+		}
 	}
 
-	log.Printf("Updated eligible counts for epoch %d, dataMarket %s: %d slots",
-		epochID, dataMarket, len(slotCounts))
+	log.Printf("Updated eligible counts for epoch %d, dataMarket %s, day %s: %d slots",
+		epochID, dataMarket, day, len(slotCounts))
 
 	return nil
 }
 
-// GetCounts returns the current counts for a data market
+// GetCounts returns the current counts for a data market (all days combined)
 func (sc *SubmissionCounter) GetCounts(dataMarket string) map[uint64]int {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
-	if counts, ok := sc.counts[dataMarket]; ok {
-		// Return a copy
-		result := make(map[uint64]int)
-		for slotID, count := range counts {
-			result[slotID] = count
+	result := make(map[uint64]int)
+	if dayCounts, ok := sc.counts[dataMarket]; ok {
+		// Combine counts from all days
+		for _, slotCounts := range dayCounts {
+			for slotID, count := range slotCounts {
+				result[slotID] += count
+			}
 		}
-		return result
+	}
+
+	return result
+}
+
+// GetCountsForDay returns the counts for a specific day
+// Reads from Redis first (source of truth), falls back to in-memory cache
+func (sc *SubmissionCounter) GetCountsForDay(dataMarket string, day string) map[uint64]int {
+	// Try Redis first (source of truth)
+	if redis.RedisClient != nil {
+		// Get all eligible slots for this day
+		eligibleNodesKey := redis.EligibleNodesByDayKey(dataMarket, day)
+		slotIDs, err := redis.SMembers(sc.ctx, eligibleNodesKey)
+		if err == nil && len(slotIDs) > 0 {
+			result := make(map[uint64]int)
+			for _, slotIDStr := range slotIDs {
+				slotID, err := strconv.ParseUint(slotIDStr, 10, 64)
+				if err != nil {
+					continue
+				}
+				// Read from EligibleSlotSubmissionKey (or SlotSubmissionKey as fallback)
+				eligibleKey := redis.EligibleSlotSubmissionKey(dataMarket, slotIDStr, day)
+				countStr, err := redis.Get(sc.ctx, eligibleKey)
+				if err == nil && countStr != "" {
+					if count, err := strconv.Atoi(countStr); err == nil {
+						result[slotID] = count
+					}
+				} else {
+					// Fallback to SlotSubmissionKey
+					slotKey := redis.SlotSubmissionKey(dataMarket, slotIDStr, day)
+					countStr, err := redis.Get(sc.ctx, slotKey)
+					if err == nil && countStr != "" {
+						if count, err := strconv.Atoi(countStr); err == nil {
+							result[slotID] = count
+						}
+					}
+				}
+			}
+			if len(result) > 0 {
+				return result
+			}
+		}
+	}
+
+	// Fallback to in-memory cache
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	if dayCounts, ok := sc.counts[dataMarket]; ok {
+		if slotCounts, ok := dayCounts[day]; ok {
+			// Return a copy
+			result := make(map[uint64]int)
+			for slotID, count := range slotCounts {
+				result[slotID] = count
+			}
+			return result
+		}
 	}
 
 	return make(map[uint64]int)
 }
 
-// GetAllCounts returns all counts across all data markets
+// GetAllCounts returns all counts across all data markets (all days combined)
 func (sc *SubmissionCounter) GetAllCounts() map[string]map[uint64]int {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
 	result := make(map[string]map[uint64]int)
-	for dataMarket, slotCounts := range sc.counts {
+	for dataMarket, dayCounts := range sc.counts {
 		result[dataMarket] = make(map[uint64]int)
-		for slotID, count := range slotCounts {
-			result[dataMarket][slotID] = count
+		// Combine counts from all days
+		for _, slotCounts := range dayCounts {
+			for slotID, count := range slotCounts {
+				result[dataMarket][slotID] += count
+			}
 		}
 	}
 
@@ -246,16 +363,81 @@ func (sc *SubmissionCounter) GetAllCounts() map[string]map[uint64]int {
 
 // GetEligibleNodesCount returns the number of slots with eligible submissions (>0 projects with majority votes)
 // A slot is eligible if it has at least one submission with >51% validator votes
+// Returns count for all days combined
 func (sc *SubmissionCounter) GetEligibleNodesCount(dataMarket string) int {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
+	eligibleSlots := make(map[uint64]bool)
+	if dayCounts, ok := sc.counts[dataMarket]; ok {
+		for _, slotCounts := range dayCounts {
+			for slotID, submissionCount := range slotCounts {
+				if submissionCount > 0 {
+					eligibleSlots[slotID] = true
+				}
+			}
+		}
+	}
+
+	return len(eligibleSlots)
+}
+
+// GetEligibleNodesCountForDay returns the number of slots with eligible submissions >= dailySnapshotQuota for a specific day
+// dailySnapshotQuota: The quota threshold from DataMarket contract (pass 0 to count all slots with count > 0)
+func (sc *SubmissionCounter) GetEligibleNodesCountForDay(dataMarket string, day string, dailySnapshotQuota int) int {
+	// Try Redis first (source of truth)
+	if redis.RedisClient != nil {
+		eligibleNodesKey := redis.EligibleNodesByDayKey(dataMarket, day)
+		slotIDs, err := redis.SMembers(sc.ctx, eligibleNodesKey)
+		if err == nil {
+			eligibleCount := 0
+			for _, slotIDStr := range slotIDs {
+				// Read count from EligibleSlotSubmissionKey (or SlotSubmissionKey as fallback)
+				eligibleKey := redis.EligibleSlotSubmissionKey(dataMarket, slotIDStr, day)
+				countStr, err := redis.Get(sc.ctx, eligibleKey)
+				if err != nil || countStr == "" {
+					// Fallback to SlotSubmissionKey
+					slotKey := redis.SlotSubmissionKey(dataMarket, slotIDStr, day)
+					countStr, err = redis.Get(sc.ctx, slotKey)
+				}
+				if err == nil && countStr != "" {
+					if count, err := strconv.Atoi(countStr); err == nil {
+						// Check if count meets quota threshold
+						if dailySnapshotQuota == 0 {
+							// If quota is 0, count all slots with submissions
+							if count > 0 {
+								eligibleCount++
+							}
+						} else {
+							// Count slots that meet or exceed quota
+							if count >= dailySnapshotQuota {
+								eligibleCount++
+							}
+						}
+					}
+				}
+			}
+			return eligibleCount
+		}
+	}
+
+	// Fallback to in-memory cache
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
 	count := 0
-	if slotCounts, ok := sc.counts[dataMarket]; ok {
-		for _, submissionCount := range slotCounts {
-			// Count slots that have at least one project submission with majority votes
-			if submissionCount > 0 {
-				count++
+	if dayCounts, ok := sc.counts[dataMarket]; ok {
+		if slotCounts, ok := dayCounts[day]; ok {
+			for _, submissionCount := range slotCounts {
+				if dailySnapshotQuota == 0 {
+					if submissionCount > 0 {
+						count++
+					}
+				} else {
+					if submissionCount >= dailySnapshotQuota {
+						count++
+					}
+				}
 			}
 		}
 	}
@@ -270,6 +452,17 @@ func (sc *SubmissionCounter) ResetCounts(dataMarket string) {
 
 	delete(sc.counts, dataMarket)
 	log.Printf("Reset counts for data market %s", dataMarket)
+}
+
+// ResetCountsForDay resets counts for a specific day (useful after final update)
+func (sc *SubmissionCounter) ResetCountsForDay(dataMarket string, day string) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if dayCounts, ok := sc.counts[dataMarket]; ok {
+		delete(dayCounts, day)
+		log.Printf("Reset counts for data market %s, day %s", dataMarket, day)
+	}
 }
 
 // Helper function

@@ -13,7 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
+	rpchelper "github.com/powerloom/go-rpc-helper"
 )
 
 // EpochReleasedEvent represents an EpochReleased event from the protocol state contract
@@ -30,7 +30,7 @@ type EpochReleasedEvent struct {
 // EventMonitor monitors EpochReleased events from the protocol state contract
 type EventMonitor struct {
 	ctx                context.Context
-	client             *ethclient.Client
+	rpcHelper          *rpchelper.RPCHelper
 	protocolContract   common.Address
 	dataMarketFilter   map[string]bool // Set of data market addresses to monitor (empty = all)
 	eventCallback      func(*EpochReleasedEvent) error
@@ -38,15 +38,10 @@ type EventMonitor struct {
 	pollInterval       time.Duration
 }
 
-// NewEventMonitor creates a new event monitor
-func NewEventMonitor(ctx context.Context, rpcURL string, protocolContract string, dataMarkets []string) (*EventMonitor, error) {
-	if rpcURL == "" {
-		return nil, fmt.Errorf("POWERLOOM_RPC_URL is required for event monitoring")
-	}
-
-	client, err := ethclient.Dial(rpcURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to RPC: %w", err)
+// NewEventMonitor creates a new event monitor using RPC helper
+func NewEventMonitor(ctx context.Context, rpcHelper *rpchelper.RPCHelper, protocolContract string, dataMarkets []string) (*EventMonitor, error) {
+	if rpcHelper == nil {
+		return nil, fmt.Errorf("RPC helper is required for event monitoring")
 	}
 
 	protocolAddr := common.HexToAddress(protocolContract)
@@ -71,7 +66,7 @@ func NewEventMonitor(ctx context.Context, rpcURL string, protocolContract string
 
 	return &EventMonitor{
 		ctx:                ctx,
-		client:             client,
+		rpcHelper:          rpcHelper,
 		protocolContract:   protocolAddr,
 		dataMarketFilter:   dataMarketFilter,
 		lastProcessedBlock: 0,
@@ -96,11 +91,11 @@ func (em *EventMonitor) Start() error {
 
 	// If no start block specified, use latest block
 	if startBlock == 0 {
-		header, err := em.client.HeaderByNumber(em.ctx, nil)
+		blockNum, err := em.rpcHelper.BlockNumber(em.ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get latest block: %w", err)
 		}
-		startBlock = header.Number.Uint64()
+		startBlock = blockNum
 		log.Printf("Starting event monitoring from latest block: %d", startBlock)
 	} else {
 		log.Printf("Starting event monitoring from block: %d", startBlock)
@@ -134,12 +129,10 @@ func (em *EventMonitor) pollEvents() {
 // processNewBlocks processes new blocks for EpochReleased events
 func (em *EventMonitor) processNewBlocks() error {
 	// Get latest block
-	header, err := em.client.HeaderByNumber(em.ctx, nil)
+	latestBlock, err := em.rpcHelper.BlockNumber(em.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
-
-	latestBlock := header.Number.Uint64()
 
 	// Process blocks in batches if we're behind
 	batchSize := uint64(1000)
@@ -174,7 +167,7 @@ func (em *EventMonitor) processNewBlocks() error {
 		},
 	}
 
-	logs, err := em.client.FilterLogs(em.ctx, query)
+	logs, err := em.rpcHelper.FilterLogs(em.ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to filter logs: %w", err)
 	}
@@ -252,7 +245,7 @@ func (em *EventMonitor) parseEpochReleasedEvent(vLog types.Log) (*EpochReleasedE
 
 // Close closes the event monitor
 func (em *EventMonitor) Close() {
-	if em.client != nil {
-		em.client.Close()
+	if em.rpcHelper != nil {
+		em.rpcHelper.Close()
 	}
 }

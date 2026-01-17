@@ -17,4 +17,128 @@ services:
       # Logging - always set these
       - LOG_FILE=/app/logs/p2p-debugger.log
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Override RELAYER_URL to use docker service name if not set
+      - RELAYER_URL=${RELAYER_URL:-http://relayer-py:8080}
+    depends_on:
+      redis:
+        condition: service_healthy
+      relayer-py:
+        condition: service_healthy
+    networks:
+      - debugger-net
     command: ["./p2p-debugger"]
+
+  # Redis - Required by relayer-py and p2p-debugger (for submission count caching)
+  redis:
+    image: redis:alpine
+    command: redis-server --appendonly yes
+    # Note: Redis is NOT exposed to host - only accessible within docker network
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - debugger-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+  # RabbitMQ - Required by relayer-py
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASS:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics check_port_connectivity
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - debugger-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
+
+  # relayer-py - Python-based transaction relayer
+  # Image tag: Set RELAYER_PY_IMAGE_TAG env var (defaults to "latest")
+  # If ./relayer-py directory exists, builds from source and tags with image name
+  # If ./relayer-py doesn't exist, pulls pre-built image from registry
+  relayer-py:
+    image: ${RELAYER_PY_IMAGE:-ghcr.io/powerloom/relayer-py:${RELAYER_PY_IMAGE_TAG:-latest}}
+    build:
+      context: ./relayer-py
+      dockerfile: Dockerfile
+    container_name: p2p-debugger-relayer-py
+    environment:
+      # Core RPC Configuration
+      - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
+      - PROTOCOL_STATE_ADDRESS=${PROTOCOL_STATE_CONTRACT}
+      - ANCHOR_CHAIN_ID=${ANCHOR_CHAIN_ID:-11167}
+      # Minimum signer balance check (default: 0 to disable for devnet)
+      - MIN_SIGNER_BALANCE_ETH=${MIN_SIGNER_BALANCE_ETH:-0}
+      # Multi-signer Configuration (comma-separated)
+      - VPA_SIGNER_ADDRESSES=${VPA_SIGNER_ADDRESSES}
+      - VPA_SIGNER_PRIVATE_KEYS=${VPA_SIGNER_PRIVATE_KEYS}
+      # Redis Configuration
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      # RabbitMQ Configuration
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=${RABBITMQ_USER:-guest}
+      - RABBITMQ_PASS=${RABBITMQ_PASS:-guest}
+      # Auth token for relayer API
+      - AUTH_TOKEN=${RELAYER_AUTH_TOKEN}
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - debugger-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Note: relayer-py is NOT exposed to host - only accessible internally via Docker network
+    # p2p-debugger connects via http://relayer-py:8080 (Docker service name)
+    volumes:
+      - ./relayer-logs:/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
+
+networks:
+  debugger-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  rabbitmq-data:

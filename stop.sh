@@ -34,7 +34,15 @@ $DOCKER_COMPOSE_CMD stop --timeout 10 2>&1 | grep -v "Error\|cannot\|No such" ||
 echo "🔪 Force killing any remaining containers..."
 $DOCKER_COMPOSE_CMD kill 2>&1 | grep -v "Error\|cannot\|No such" || true
 
-echo "🗑️  Removing containers and volumes..."
-$DOCKER_COMPOSE_CMD down --volumes --remove-orphans 2>&1 | grep -v "Error\|cannot\|No such" || true
+# Check if user wants to preserve volumes (e.g., Redis data)
+if [ "$1" == "--keep-data" ] || [ "$1" == "-k" ]; then
+    echo "🗑️  Removing containers (preserving volumes/data)..."
+    $DOCKER_COMPOSE_CMD down --remove-orphans 2>&1 | grep -v "Error\|cannot\|No such" || true
+    echo "💾 Redis and RabbitMQ data preserved"
+else
+    echo "🗑️  Removing containers and volumes..."
+    $DOCKER_COMPOSE_CMD down --volumes --remove-orphans 2>&1 | grep -v "Error\|cannot\|No such" || true
+    echo "🗑️  All data (including Redis) has been removed"
+fi
 
 echo "✅ Cleanup complete"

@@ -51,19 +51,37 @@ func setupDHT(ctx context.Context, h host.Host, bootstrapPeers []multiaddr.Multi
 		return nil, err
 	}
 
-	// Connect to bootstrap peers
+	// Connect to bootstrap peers (filter reserved IPs)
+	connectedCount := 0
+	filteredCount := 0
 	for _, peerAddr := range bootstrapPeers {
+		// Filter out reserved IP addresses
+		if HasReservedIPAddress(peerAddr) {
+			filteredCount++
+			continue
+		}
 		peerinfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
 		if err != nil {
 			log.Printf("Failed to parse bootstrap peer address: %v", err)
 			continue
 		}
+		// Filter peer addresses
+		filteredAddrs, _ := FilterReservedMultiaddrs(peerinfo.Addrs)
+		if len(filteredAddrs) == 0 {
+			filteredCount++
+			continue
+		}
+		peerinfo.Addrs = filteredAddrs
 		if err := h.Connect(ctx, *peerinfo); err != nil {
 			log.Printf("Failed to connect to bootstrap peer %s: %v", peerinfo.ID, err)
 		} else {
-			log.Printf("Successfully connected to bootstrap peer: %s", peerAddr)
+			connectedCount++
 		}
 	}
+	if filteredCount > 0 {
+		log.Printf("Filtered %d bootstrap peer(s) with reserved IP addresses", filteredCount)
+	}
+	log.Printf("Connected to %d/%d bootstrap peer(s)", connectedCount, len(bootstrapPeers)-filteredCount)
 
 	return kademliaDHT, nil
 }
@@ -78,7 +96,6 @@ func discoverPeers(ctx context.Context, h host.Host, routingDiscovery *routing.R
 	// Continuously discover peers
 	go func() {
 		for {
-			log.Printf("Searching for peers on rendezvous: %s", rendezvous)
 			peerChan, err := routingDiscovery.FindPeers(ctx, rendezvous)
 			if err != nil {
 				log.Printf("Error discovering peers: %v", err)
@@ -86,19 +103,40 @@ func discoverPeers(ctx context.Context, h host.Host, routingDiscovery *routing.R
 				continue
 			}
 
+			// Track connection attempts for summary logging
+			attemptedCount := 0
+			connectedCount := 0
+			filteredCount := 0
+
 			for p := range peerChan {
 				if p.ID == h.ID() {
 					continue
 				}
 				if h.Network().Connectedness(p.ID) != 2 { // Not connected
-					log.Printf("Found peer through discovery: %s", p.ID)
+					// Filter out reserved IP addresses before attempting connection
+					filteredAddrs, _ := FilterReservedMultiaddrs(p.Addrs)
+					if len(filteredAddrs) == 0 {
+						filteredCount++
+						continue // Skip peers with only reserved IP addresses
+					}
+					p.Addrs = filteredAddrs
+					attemptedCount++
 					if err := h.Connect(ctx, p); err != nil {
-						log.Printf("Failed to connect to discovered peer %s: %v", p.ID, err)
+						// Only log connection failures (not "no addresses" errors which are common)
+						if !strings.Contains(err.Error(), "no addresses") {
+							log.Printf("Failed to connect to discovered peer %s: %v", p.ID, err)
+						}
 					} else {
-						log.Printf("Connected to discovered peer: %s", p.ID)
+						connectedCount++
 					}
 				}
 			}
+
+			// Log summary instead of individual peer logs
+			if attemptedCount > 0 || filteredCount > 0 {
+				log.Printf("Peer discovery summary: attempted=%d, connected=%d, filtered=%d (reserved IPs)", attemptedCount, connectedCount, filteredCount)
+			}
+
 			time.Sleep(30 * time.Second) // Wait before next discovery round
 		}
 	}()
@@ -262,11 +300,15 @@ func main() {
 		}
 	}
 
+	// Create RFC1918 connection gater to block reserved IP addresses
+	rfc1918Gater := &RFC1918ConnectionGater{}
+
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", *listenPort)),
 		libp2p.EnableRelay(),
 		libp2p.ConnectionManager(connMgr),
+		libp2p.ConnectionGater(rfc1918Gater),
 	}
 
 	if *publicIP != "" {

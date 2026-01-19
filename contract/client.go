@@ -27,6 +27,7 @@ type Client struct {
 	relayerAuthToken    string
 	evmPrivateKey       string // EVM private key for direct contract calls (secp256k1)
 	updateEpochInterval int64
+	batchSize           int // Batch size for splitting slot IDs and submission counts
 }
 
 // NewClient creates a new contract client
@@ -37,6 +38,7 @@ func NewClient() (*Client, error) {
 		return &Client{
 			updateMethod:        "disabled",
 			updateEpochInterval: 0,
+			batchSize:           50, // Default even when disabled
 		}, nil
 	}
 
@@ -85,6 +87,13 @@ func NewClient() (*Client, error) {
 		}
 	}
 
+	batchSize := 50 // Default batch size (EVM-safe limit)
+	if batchSizeStr := os.Getenv("REWARDS_UPDATE_BATCH_SIZE"); batchSizeStr != "" {
+		if bs, err := strconv.Atoi(batchSizeStr); err == nil && bs > 0 {
+			batchSize = bs
+		}
+	}
+
 	client := &Client{
 		protocolContract:    protocolContract,
 		dataMarketABI:       dataMarketABI,
@@ -93,6 +102,7 @@ func NewClient() (*Client, error) {
 		relayerAuthToken:    relayerAuthToken,
 		evmPrivateKey:       evmPrivateKey,
 		updateEpochInterval: updateInterval,
+		batchSize:           batchSize,
 	}
 
 	// Initialize RPC helper with multiple nodes (needed for day fetching even with relayer method)

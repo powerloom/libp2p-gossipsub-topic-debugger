@@ -11,11 +11,7 @@ This utility serves two primary purposes:
 
 ## Why This Exists
 
-During the transition from centralized sequencer to decentralized sequencer-validator (DSV) mesh:
-
-- **Legacy System**: The centralized `submission-sequencer-event-collector` periodically updated eligible submission counts on the protocol contract
-- **New System**: DSV nodes perform Level 2 aggregations and commit them via VPA (Validator Priority Assignment), but they don't update submission counts or end-of-day reward updates
-- **Transition Solution**: This utility independently joins the validator mesh, listens to finalized batches from all validators, aggregates them using consensus logic, and updates the protocol contract - bridging the gap during the transition
+DSV nodes perform Level 2 aggregations and commit them via VPA (Validator Priority Assignment), but they don't update submission counts or end-of-day reward updates. This utility independently joins the validator mesh, listens to finalized batches from all validators, aggregates them using consensus logic, and updates the protocol contract with submission counts and rewards.
 
 **Important Notes**:
 - **Level 1 vs Level 2 Batches**: The validator mesh (`/powerloom/finalized-batches/all`) only receives **Level 1 finalizations** (individual validator's local batches). Level 2 aggregated batches are created locally by each validator and are NOT broadcast back to the network. This utility performs its own Level 2 aggregation from the Level 1 batches it receives.

@@ -626,20 +626,12 @@ func main() {
 			if len(nodes) == 0 {
 				log.Printf("Event monitoring disabled (POWERLOOM_RPC_NODES is empty)")
 			} else {
-				// Get event monitoring addresses (can be different from submission update addresses)
-				// Fallback to main addresses if event monitor addresses not set
-				eventProtocolContract := os.Getenv("EVENT_MONITOR_PROTOCOL_STATE_CONTRACT")
-				if eventProtocolContract == "" {
-					eventProtocolContract = os.Getenv("PROTOCOL_STATE_CONTRACT")
-				}
-
-				eventDataMarket := os.Getenv("EVENT_MONITOR_DATA_MARKET_ADDRESS")
-				if eventDataMarket == "" {
-					eventDataMarket = configuredDataMarket
-				}
+				// Use PROTOCOL_STATE_CONTRACT and DATA_MARKET_ADDRESS for event monitoring
+				eventProtocolContract := os.Getenv("PROTOCOL_STATE_CONTRACT")
+				eventDataMarket := configuredDataMarket
 
 				if eventProtocolContract == "" {
-					log.Printf("Event monitoring disabled (EVENT_MONITOR_PROTOCOL_STATE_CONTRACT and PROTOCOL_STATE_CONTRACT not set)")
+					log.Printf("Event monitoring disabled (PROTOCOL_STATE_CONTRACT not set)")
 				} else {
 					// Build RPC config for event monitoring
 					rpcConfig := &rpchelper.RPCConfig{
@@ -667,11 +659,10 @@ func main() {
 					}
 					cancel()
 
-					// Filter events by event monitoring data market
+					// Filter events by data market
 					dataMarketsFilter := []string{eventDataMarket}
 
 					log.Printf("Event monitoring: protocolState=%s, dataMarket=%s", eventProtocolContract, eventDataMarket)
-					log.Printf("Submission updates: protocolState=%s, dataMarket=%s", os.Getenv("PROTOCOL_STATE_CONTRACT"), configuredDataMarket)
 
 					eventMonitor, err = NewEventMonitor(ctx, eventRpcHelper, eventProtocolContract, dataMarketsFilter)
 					if err != nil {
@@ -679,15 +670,8 @@ func main() {
 					}
 					defer eventMonitor.Close()
 
-					// Set event callback
-					// IMPORTANT: Monitor events from legacy contracts, but create windows using NEW addresses
-					// This ensures windows are stored with correct addresses for future migration
 					eventMonitor.SetEventCallback(func(event *EpochReleasedEvent) error {
-						// Create a modified event with NEW data market address for window creation
-						// The event came from legacy contract, but window should use new address
-						modifiedEvent := *event
-						modifiedEvent.DataMarketAddress = common.HexToAddress(configuredDataMarket)
-						return windowManager.OnEpochReleased(&modifiedEvent)
+						return windowManager.OnEpochReleased(event)
 					})
 
 					// Start event monitoring

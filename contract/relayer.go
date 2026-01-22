@@ -6,6 +6,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"time"
@@ -13,6 +15,7 @@ import (
 
 // UpdateRewardsRequest represents the request payload for updateRewards (deprecated, kept for backward compatibility)
 type UpdateRewardsRequest struct {
+	MessageType       string     `json:"messageType"`
 	DataMarketAddress string     `json:"dataMarketAddress"`
 	SlotIDs           []*big.Int `json:"slotIDs"`
 	SubmissionsList   []*big.Int `json:"submissionsList"`
@@ -23,6 +26,7 @@ type UpdateRewardsRequest struct {
 
 // UpdateSubmissionCountsRequest represents the request payload for periodic submission count updates
 type UpdateSubmissionCountsRequest struct {
+	MessageType       string     `json:"messageType"`
 	DataMarketAddress string     `json:"dataMarketAddress"`
 	SlotIDs           []*big.Int `json:"slotIDs"`
 	SubmissionsList   []*big.Int `json:"submissionsList"`
@@ -32,6 +36,7 @@ type UpdateSubmissionCountsRequest struct {
 
 // UpdateEligibleNodesRequest represents the request payload for updating eligible nodes (Step 1)
 type UpdateEligibleNodesRequest struct {
+	MessageType       string   `json:"messageType"`
 	DataMarketAddress string   `json:"dataMarketAddress"`
 	Day               *big.Int `json:"day"`
 	EligibleNodes     int      `json:"eligibleNodes"`
@@ -40,6 +45,7 @@ type UpdateEligibleNodesRequest struct {
 
 // UpdateEligibleSubmissionCountsRequest represents the request payload for updating eligible submission counts (Step 2)
 type UpdateEligibleSubmissionCountsRequest struct {
+	MessageType       string     `json:"messageType"`
 	DataMarketAddress string     `json:"dataMarketAddress"`
 	SlotIDs           []*big.Int `json:"slotIDs"`
 	SubmissionsList   []*big.Int `json:"submissionsList"`
@@ -106,6 +112,7 @@ func (rc *RelayerClient) SendUpdateRewards(ctx context.Context, dataMarketAddres
 // SendUpdateSubmissionCounts sends a periodic submission count update request to the relayer
 func (rc *RelayerClient) SendUpdateSubmissionCounts(ctx context.Context, dataMarketAddress string, slotIDs, submissionsList []*big.Int, day *big.Int) error {
 	request := UpdateSubmissionCountsRequest{
+		MessageType:       "UpdateSubmissionCounts",
 		DataMarketAddress: dataMarketAddress,
 		SlotIDs:           slotIDs,
 		SubmissionsList:   submissionsList,
@@ -140,6 +147,7 @@ func (rc *RelayerClient) SendUpdateSubmissionCounts(ctx context.Context, dataMar
 // SendUpdateEligibleNodes sends an eligible nodes update request to the relayer (Step 1)
 func (rc *RelayerClient) SendUpdateEligibleNodes(ctx context.Context, dataMarketAddress string, day *big.Int, eligibleNodes int) error {
 	request := UpdateEligibleNodesRequest{
+		MessageType:       "UpdateEligibleNodes",
 		DataMarketAddress: dataMarketAddress,
 		Day:               day,
 		EligibleNodes:     eligibleNodes,
@@ -173,6 +181,7 @@ func (rc *RelayerClient) SendUpdateEligibleNodes(ctx context.Context, dataMarket
 // SendUpdateEligibleSubmissionCounts sends an eligible submission counts update request to the relayer (Step 2)
 func (rc *RelayerClient) SendUpdateEligibleSubmissionCounts(ctx context.Context, dataMarketAddress string, slotIDs, submissionsList []*big.Int, day *big.Int) error {
 	request := UpdateEligibleSubmissionCountsRequest{
+		MessageType:       "UpdateEligibleSubmissionCounts",
 		DataMarketAddress: dataMarketAddress,
 		SlotIDs:           slotIDs,
 		SubmissionsList:   submissionsList,
@@ -191,15 +200,26 @@ func (rc *RelayerClient) SendUpdateEligibleSubmissionCounts(ctx context.Context,
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	log.Printf("📤 [Step 2] Sending batch to relayer: day=%s, slots=%d, firstSlot=%s, lastSlot=%s",
+		day.String(), len(slotIDs), slotIDs[0].String(), slotIDs[len(slotIDs)-1].String())
+
 	resp, err := rc.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send update eligible submission counts request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to send update eligible submission counts request, status code: %d", resp.StatusCode)
+	// Read response body to check for errors
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("❌ [Step 2] Relayer returned error: status=%d, body=%s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to send update eligible submission counts request, status code: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("✅ [Step 2] Relayer accepted batch: day=%s, slots=%d, response=%s", day.String(), len(slotIDs), string(body))
 	return nil
 }

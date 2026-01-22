@@ -276,6 +276,9 @@ func (u *Updater) UpdateFinalRewards(ctx context.Context, currentEpoch uint64, d
 			batchSubmissions := submissionsList[start:end]
 			batchNum := (start / batchSize) + 1
 
+			log.Printf("📦 [Step 2] Preparing batch %d/%d: day=%s, slots=%d-%d (total=%d slots)",
+				batchNum, numBatches, day, start, end-1, len(batchSlotIDs))
+
 			wg.Add(1)
 			go func(batchNum, start, end int, batchSlotIDs, batchSubmissions []*big.Int) {
 				defer wg.Done()
@@ -286,6 +289,7 @@ func (u *Updater) UpdateFinalRewards(ctx context.Context, currentEpoch uint64, d
 
 				// Use retry logic for each batch
 				operation2 := func() error {
+					log.Printf("🚀 [Step 2] Sending batch %d/%d to relayer: day=%s, slots=%d", batchNum, numBatches, day, len(batchSlotIDs))
 					return u.relayer.SendUpdateEligibleSubmissionCounts(batchCtx, dataMarketAddress, batchSlotIDs, batchSubmissions, dayBigInt)
 				}
 

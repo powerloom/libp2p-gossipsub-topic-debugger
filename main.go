@@ -516,9 +516,20 @@ func main() {
 				}
 			}
 
+			// Get daily snapshot quota for eligibility check
+			dailySnapshotQuota := 0
+			if quotaCache != nil {
+				quota, err := quotaCache.GetQuotaWithContext(callCtx, dataMarket)
+				if err != nil {
+					log.Printf("⚠️ Failed to get dailySnapshotQuota for eligibility check: %v. Using count > 0 as fallback.", err)
+				} else {
+					dailySnapshotQuota = int(quota.Int64())
+				}
+			}
+
 			// Update submission counter with day tracking
 			if currentDay != "" {
-				if err := submissionCounter.UpdateEligibleCountsForDay(epochID, dataMarket, currentDay, slotCounts); err != nil {
+				if err := submissionCounter.UpdateEligibleCountsForDay(epochID, dataMarket, currentDay, slotCounts, dailySnapshotQuota); err != nil {
 					return fmt.Errorf("failed to update eligible counts: %w", err)
 				}
 			} else {

@@ -195,3 +195,25 @@ func Expire(ctx context.Context, key string, expiration time.Duration) error {
 	}
 	return RedisClient.Expire(ctx, key, expiration).Err()
 }
+
+// Del deletes one or more Redis keys
+func Del(ctx context.Context, keys ...string) (int64, error) {
+	if RedisClient == nil {
+		return 0, errors.New("Redis client not initialized")
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	return RedisClient.Del(ctx, keys...).Result()
+}
+
+// Unlink removes one or more Redis keys asynchronously (non-blocking)
+func Unlink(ctx context.Context, keys ...string) (int64, error) {
+	if RedisClient == nil {
+		return 0, errors.New("Redis client not initialized")
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	return RedisClient.Unlink(ctx, keys...).Result()
+}

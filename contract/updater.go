@@ -249,6 +249,19 @@ func (u *Updater) UpdateFinalRewards(ctx context.Context, currentEpoch uint64, d
 
 		log.Printf("✅ Step 1 complete: Updated eligible nodes count (%d) for day %s", eligibleNodesCount, day)
 
+		// Wait before starting Step 2 to allow Step 1 transaction to be mined
+		// This prevents gas estimation failures when Step 2 calls fire too rapidly
+		stepDelay := u.client.step1ToStep2Delay
+		if stepDelay > 0 {
+			log.Printf("⏳ Waiting %v before starting Step 2 (allowing Step 1 transaction to be mined)...", stepDelay)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(stepDelay):
+				log.Printf("✅ Delay complete, starting Step 2 batches")
+			}
+		}
+
 		// Step 2: Update eligible submission counts and distribute rewards (batched)
 		if totalSlots == 0 {
 			log.Printf("No slots to update for final rewards: data market %s, day %s", dataMarketAddress, day)

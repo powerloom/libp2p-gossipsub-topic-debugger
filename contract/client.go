@@ -28,7 +28,8 @@ type Client struct {
 	relayerAuthToken    string
 	evmPrivateKey       string // EVM private key for direct contract calls (secp256k1)
 	updateEpochInterval int64
-	batchSize           int // Batch size for splitting slot IDs and submission counts
+	batchSize           int           // Batch size for splitting slot IDs and submission counts
+	step1ToStep2Delay   time.Duration // Delay between Step 1 (updateEligibleNodes) and Step 2 (updateEligibleSubmissionCounts)
 }
 
 // NewClient creates a new contract client
@@ -95,6 +96,15 @@ func NewClient() (*Client, error) {
 		}
 	}
 
+	// Delay between Step 1 (updateEligibleNodes) and Step 2 (updateEligibleSubmissionCounts)
+	// Default: 3 seconds to allow Step 1 transaction to be mined
+	step1ToStep2Delay := 3 * time.Second
+	if delayStr := os.Getenv("STEP1_TO_STEP2_DELAY_SECONDS"); delayStr != "" {
+		if delay, err := strconv.Atoi(delayStr); err == nil && delay >= 0 {
+			step1ToStep2Delay = time.Duration(delay) * time.Second
+		}
+	}
+
 	client := &Client{
 		protocolContract:    protocolContract,
 		dataMarketABI:       dataMarketABI,
@@ -104,6 +114,7 @@ func NewClient() (*Client, error) {
 		evmPrivateKey:       evmPrivateKey,
 		updateEpochInterval: updateInterval,
 		batchSize:           batchSize,
+		step1ToStep2Delay:   step1ToStep2Delay,
 	}
 
 	// Initialize RPC helper with multiple nodes (needed for day fetching even with relayer method)

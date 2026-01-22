@@ -185,9 +185,12 @@ func (u *Updater) UpdateSubmissionCounts(ctx context.Context, epochID uint64, da
 
 // UpdateFinalRewards sends final reward update for a previous day at buffer epoch
 func (u *Updater) UpdateFinalRewards(ctx context.Context, currentEpoch uint64, dataMarketAddress string, day string, counts map[uint64]int, eligibleNodesCount int) error {
+	log.Printf("🎯 UpdateFinalRewards: ENTRY - epoch=%d, dataMarket=%s, day=%s, eligibleNodes=%d, slotCount=%d",
+		currentEpoch, dataMarketAddress, day, eligibleNodesCount, len(counts))
+
 	// Check if contract updates are enabled
 	if u.client.GetUpdateMethod() == "disabled" {
-		log.Printf("Contract updates disabled (ENABLE_CONTRACT_UPDATES=false)")
+		log.Printf("❌ UpdateFinalRewards: Contract updates disabled (ENABLE_CONTRACT_UPDATES=false) - exiting early")
 		return nil
 	}
 
@@ -219,7 +222,7 @@ func (u *Updater) UpdateFinalRewards(ctx context.Context, currentEpoch uint64, d
 	}
 
 	if len(slotIDs) == 0 {
-		log.Printf("No submissions to update for final rewards: data market %s, day %s", dataMarketAddress, day)
+		log.Printf("⚠️ UpdateFinalRewards: No submissions to update for final rewards: data market %s, day %s - exiting early", dataMarketAddress, day)
 		return nil
 	}
 

@@ -54,9 +54,13 @@ func (dtm *DayTransitionManager) CheckDayTransition(dataMarket string, currentDa
 	// First time seeing this data market
 	if !exists {
 		dtm.lastKnownDay[dataMarket] = currentDay
-		log.Printf("📅 Initialized day tracking for data market %s: day %s", dataMarket, currentDay)
+		log.Printf("📅 Initialized day tracking for data market %s: day %s (epoch %d)", dataMarket, currentDay, currentEpoch)
 		return false
 	}
+
+	// Log comparison details
+	log.Printf("📅 CheckDayTransition: dataMarket=%s, lastKnownDay=%s, currentDay=%s, epoch=%d",
+		dataMarket, lastDay, currentDay, currentEpoch)
 
 	// Day transition detected
 	if lastDay != currentDay {
@@ -108,45 +112,76 @@ func (dtm *DayTransitionManager) CheckDayTransition(dataMarket string, currentDa
 		return true
 	}
 
+	// Day hasn't changed
+	log.Printf("📅 No day transition: dataMarket=%s, day unchanged at %s (epoch %d)", dataMarket, currentDay, currentEpoch)
 	return false
 }
 
 // IsBufferEpoch checks if the current epoch is a buffer epoch for any day transition
 // Checks Redis first (source of truth), falls back to in-memory cache
 func (dtm *DayTransitionManager) IsBufferEpoch(dataMarket string, currentEpoch uint64) (*DayTransitionInfo, bool) {
+	log.Printf("🔍 IsBufferEpoch: Checking if epoch %d is a buffer epoch for dataMarket %s", currentEpoch, dataMarket)
+
 	// Try Redis first (source of truth)
 	if redis.RedisClient != nil {
 		epochMarkerKeys, err := redis.SMembers(dtm.ctx, redis.DayRolloverEpochMarkerSet(dataMarket))
-		if err == nil {
+		if err != nil {
+			log.Printf("⚠️ IsBufferEpoch: Failed to get marker set from Redis: %v", err)
+		} else {
+			log.Printf("🔍 IsBufferEpoch: Found %d marker(s) in Redis for dataMarket %s", len(epochMarkerKeys), dataMarket)
 			for _, epochIDStr := range epochMarkerKeys {
 				// Fetch marker details from Redis
 				markerJSON, err := redis.Get(dtm.ctx, redis.DayRolloverEpochMarkerDetails(dataMarket, epochIDStr))
-				if err == nil && markerJSON != "" {
-					var marker DayTransitionInfo
-					if err := json.Unmarshal([]byte(markerJSON), &marker); err == nil {
-						if marker.BufferEpoch == int64(currentEpoch) {
-							return &marker, true
-						}
-					}
+				if err != nil {
+					log.Printf("⚠️ IsBufferEpoch: Failed to get marker details for epoch %s: %v", epochIDStr, err)
+					continue
+				}
+				if markerJSON == "" {
+					log.Printf("⚠️ IsBufferEpoch: Marker details empty for epoch %s", epochIDStr)
+					continue
+				}
+				var marker DayTransitionInfo
+				if err := json.Unmarshal([]byte(markerJSON), &marker); err != nil {
+					log.Printf("⚠️ IsBufferEpoch: Failed to unmarshal marker for epoch %s: %v", epochIDStr, err)
+					continue
+				}
+				log.Printf("🔍 IsBufferEpoch: Checking marker - epoch=%s, lastDay=%s, currentEpoch=%d, bufferEpoch=%d (currentEpoch=%d)",
+					epochIDStr, marker.LastKnownDay, marker.CurrentEpoch, marker.BufferEpoch, currentEpoch)
+				if marker.BufferEpoch == int64(currentEpoch) {
+					log.Printf("✅ IsBufferEpoch: Match found! Epoch %d is buffer epoch for day transition (lastDay=%s, transitionEpoch=%d)",
+						currentEpoch, marker.LastKnownDay, marker.CurrentEpoch)
+					return &marker, true
+				} else {
+					log.Printf("🔍 IsBufferEpoch: Marker doesn't match - bufferEpoch=%d != currentEpoch=%d", marker.BufferEpoch, currentEpoch)
 				}
 			}
 		}
+	} else {
+		log.Printf("⚠️ IsBufferEpoch: Redis client not available, skipping Redis check")
 	}
 
 	// Fallback to in-memory cache
 	dtm.mu.RLock()
 	defer dtm.mu.RUnlock()
 
+	log.Printf("🔍 IsBufferEpoch: Checking in-memory markers (found %d total markers)", len(dtm.dayTransitionMarkers))
 	// Check all markers for this data market
 	for key, marker := range dtm.dayTransitionMarkers {
 		// Extract data market from key (format: "dataMarket:epochID")
 		if len(key) > len(dataMarket) && key[:len(dataMarket)] == dataMarket {
+			log.Printf("🔍 IsBufferEpoch: Checking in-memory marker - key=%s, lastDay=%s, currentEpoch=%d, bufferEpoch=%d (currentEpoch=%d)",
+				key, marker.LastKnownDay, marker.CurrentEpoch, marker.BufferEpoch, currentEpoch)
 			if marker.BufferEpoch == int64(currentEpoch) {
+				log.Printf("✅ IsBufferEpoch: Match found in memory! Epoch %d is buffer epoch for day transition (lastDay=%s, transitionEpoch=%d)",
+					currentEpoch, marker.LastKnownDay, marker.CurrentEpoch)
 				return marker, true
+			} else {
+				log.Printf("🔍 IsBufferEpoch: In-memory marker doesn't match - bufferEpoch=%d != currentEpoch=%d", marker.BufferEpoch, currentEpoch)
 			}
 		}
 	}
 
+	log.Printf("❌ IsBufferEpoch: No matching buffer epoch found for epoch %d, dataMarket %s", currentEpoch, dataMarket)
 	return nil, false
 }
 

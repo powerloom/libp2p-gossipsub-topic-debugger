@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"os"
 	"strconv"
@@ -180,13 +181,17 @@ func loadDataMarketABI() (string, error) {
 // FetchCurrentDay fetches the current day for a data market from the DataMarket contract
 // Uses RPC helper with automatic failover across multiple nodes
 func (c *Client) FetchCurrentDay(ctx context.Context, dataMarketAddress common.Address) (*big.Int, error) {
+	log.Printf("🔍 FetchCurrentDay: Calling dayCounter() on DataMarket contract %s", dataMarketAddress.Hex())
+
 	if c.contractBackend == nil {
+		log.Printf("❌ FetchCurrentDay: RPC helper not initialized")
 		return nil, fmt.Errorf("RPC helper not initialized - POWERLOOM_RPC_NODES or POWERLOOM_RPC_URL is required for day fetching")
 	}
 
 	// Parse ABI
 	parsedABI, err := parseABI(c.dataMarketABI)
 	if err != nil {
+		log.Printf("❌ FetchCurrentDay: Failed to parse DataMarket ABI: %v", err)
 		return nil, fmt.Errorf("failed to parse DataMarket ABI: %w", err)
 	}
 
@@ -198,18 +203,22 @@ func (c *Client) FetchCurrentDay(ctx context.Context, dataMarketAddress common.A
 	callOpts := c.GetCallOpts(ctx)
 	err = contract.Call(callOpts, &result, "dayCounter")
 	if err != nil {
+		log.Printf("❌ FetchCurrentDay: Failed to call dayCounter on DataMarket contract %s: %v", dataMarketAddress.Hex(), err)
 		return nil, fmt.Errorf("failed to call dayCounter on DataMarket contract %s: %w", dataMarketAddress.Hex(), err)
 	}
 
 	if len(result) == 0 {
+		log.Printf("❌ FetchCurrentDay: dayCounter returned no result")
 		return nil, fmt.Errorf("dayCounter returned no result")
 	}
 
 	day, ok := result[0].(*big.Int)
 	if !ok {
+		log.Printf("❌ FetchCurrentDay: dayCounter returned unexpected type: %T", result[0])
 		return nil, fmt.Errorf("dayCounter returned unexpected type: %T", result[0])
 	}
 
+	log.Printf("✅ FetchCurrentDay: Successfully fetched day %s from DataMarket contract %s", day.String(), dataMarketAddress.Hex())
 	return day, nil
 }
 

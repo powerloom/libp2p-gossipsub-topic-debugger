@@ -390,6 +390,7 @@ func main() {
 	var batchProcessor *BatchProcessor
 	var submissionCounter *SubmissionCounter
 	var contractClient *contract.Client
+	var lastFetchedDay map[string]string // Track last fetched day per data market for comparison
 	var contractUpdater *contract.Updater
 	var quotaCache *QuotaCache
 	var windowManager *WindowManager
@@ -448,6 +449,9 @@ func main() {
 			quotaCache.LoadFromRedis([]string{configuredDataMarket})
 		}
 
+		// Initialize last fetched day tracker
+		lastFetchedDay = make(map[string]string)
+
 		// Set window close callback - triggers aggregation and tally dump
 		// Note: dataMarket parameter comes from EpochReleased event, but we use configured value
 		windowManager.SetWindowCloseCallback(func(epochID uint64, dataMarket string) error {
@@ -490,14 +494,25 @@ func main() {
 
 			log.Printf("📈 Extracted %d unique slot IDs for epoch %d", len(slotCounts), epochID)
 
-			// Fetch current day for tracking counts per day
+			// Fetch current day once for both count tracking and day transition checking
 			currentDay := ""
 			if contractClient != nil {
 				day, err := contractClient.FetchCurrentDay(callCtx, common.HexToAddress(dataMarket))
 				if err != nil {
-					log.Printf("⚠️  Could not fetch current day for count tracking: %v", err)
+					log.Printf("⚠️  Could not fetch current day for epoch %d: %v", epochID, err)
 				} else {
 					currentDay = day.String()
+					// Compare with last fetched day to detect changes
+					lastDay, exists := lastFetchedDay[dataMarket]
+					if !exists {
+						log.Printf("📅 First day fetch for data market %s: day %s (epoch %d)", dataMarket, currentDay, epochID)
+						lastFetchedDay[dataMarket] = currentDay
+					} else if lastDay != currentDay {
+						log.Printf("📅 Day changed for data market %s: %s -> %s (epoch %d)", dataMarket, lastDay, currentDay, epochID)
+						lastFetchedDay[dataMarket] = currentDay
+					} else {
+						log.Printf("📅 Day unchanged for data market %s: day %s (epoch %d)", dataMarket, currentDay, epochID)
+					}
 				}
 			}
 
@@ -508,6 +523,7 @@ func main() {
 				}
 			} else {
 				// Fallback: update without day tracking
+				log.Printf("⚠️  Updating counts without day tracking (day fetch failed)")
 				if err := submissionCounter.UpdateEligibleCounts(epochID, dataMarket, slotCounts); err != nil {
 					return fmt.Errorf("failed to update eligible counts: %w", err)
 				}
@@ -534,20 +550,11 @@ func main() {
 				log.Printf("❌ Error generating tally dump: %v", err)
 			}
 
-			// Fetch current day for day transition checking (if not already fetched)
-			if currentDay == "" && contractClient != nil {
-				day, err := contractClient.FetchCurrentDay(callCtx, common.HexToAddress(dataMarket))
-				if err != nil {
-					log.Printf("⚠️  Could not fetch current day for day transition check: %v", err)
-				} else {
-					currentDay = day.String()
-					log.Printf("📅 Current day for data market %s: %s (epoch %d)", dataMarket, currentDay, epochID)
-				}
-			}
-
-			// Check for day transition
+			// Check for day transition (using the same currentDay fetched above)
 			if currentDay != "" {
 				dayTransitionManager.CheckDayTransition(dataMarket, currentDay, epochID)
+			} else {
+				log.Printf("⚠️  Skipping day transition check for epoch %d (day fetch failed)", epochID)
 			}
 
 			// Update quota cache for this epoch (queries contract periodically)

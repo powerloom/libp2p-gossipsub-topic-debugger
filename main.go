@@ -678,7 +678,81 @@ func main() {
 					defer eventMonitor.Close()
 
 					eventMonitor.SetEventCallback(func(event *EpochReleasedEvent) error {
-						return windowManager.OnEpochReleased(event)
+						// Always call window manager first (creates windows for batch processing)
+						if err := windowManager.OnEpochReleased(event); err != nil {
+							return err
+						}
+
+						// CRITICAL: Check day transitions and buffer epochs on EVERY epoch,
+						// even if no batches arrive. This ensures final rewards are processed
+						// even when all nodes are down.
+						if contractClient != nil && dayTransitionManager != nil && contractUpdater != nil && submissionCounter != nil {
+							epochID := event.EpochID.Uint64()
+							dataMarket := configuredDataMarket
+
+							// Create context for contract calls
+							callCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							defer cancel()
+
+							// Fetch current day for day transition checking
+							day, err := contractClient.FetchCurrentDay(callCtx, common.HexToAddress(dataMarket))
+							if err != nil {
+								log.Printf("⚠️  Could not fetch current day for epoch %d (EpochReleased): %v", epochID, err)
+							} else {
+								currentDay := day.String()
+								// Update last fetched day tracker
+								lastDay, exists := lastFetchedDay[dataMarket]
+								if !exists {
+									lastFetchedDay[dataMarket] = currentDay
+									log.Printf("📅 [EpochReleased] First day fetch for data market %s: day %s (epoch %d)", dataMarket, currentDay, epochID)
+								} else if lastDay != currentDay {
+									lastFetchedDay[dataMarket] = currentDay
+									log.Printf("📅 [EpochReleased] Day changed for data market %s: %s -> %s (epoch %d)", dataMarket, lastDay, currentDay, epochID)
+								}
+
+								// Check for day transition (independent of batches)
+								dayTransitionManager.CheckDayTransition(dataMarket, currentDay, epochID)
+
+								// Check if this is a buffer epoch (independent of batches)
+								if marker, isBufferEpoch := dayTransitionManager.IsBufferEpoch(dataMarket, epochID); isBufferEpoch {
+									log.Printf("🎯 [EpochReleased] Buffer epoch reached for data market %s: epoch %d (previous day: %s)",
+										dataMarket, epochID, marker.LastKnownDay)
+
+									// Get daily snapshot quota from cache
+									dailySnapshotQuota := 0
+									if quotaCache != nil {
+										quota, err := quotaCache.GetQuotaWithContext(callCtx, dataMarket)
+										if err != nil {
+											log.Printf("⚠️ Failed to get dailySnapshotQuota for data market %s: %v. Using count > 0 as fallback.", dataMarket, err)
+										} else {
+											dailySnapshotQuota = int(quota.Int64())
+											log.Printf("📊 [EpochReleased] Daily snapshot quota for data market %s: %d", dataMarket, dailySnapshotQuota)
+										}
+									}
+
+									// Get submission counts for the previous day (from Redis)
+									prevDaySlotCounts := submissionCounter.GetCountsForDay(dataMarket, marker.LastKnownDay)
+									// Get eligible nodes count (slots with count >= dailySnapshotQuota)
+									prevDayEligibleNodes := submissionCounter.GetEligibleNodesCountForDay(dataMarket, marker.LastKnownDay, dailySnapshotQuota)
+
+									log.Printf("📊 [EpochReleased] Processing final rewards for day %s: %d slots, %d eligible nodes",
+										marker.LastKnownDay, len(prevDaySlotCounts), prevDayEligibleNodes)
+
+									if err := contractUpdater.UpdateFinalRewards(callCtx, epochID, dataMarket, marker.LastKnownDay, prevDaySlotCounts, prevDayEligibleNodes); err != nil {
+										log.Printf("❌ [EpochReleased] Error sending final rewards update for data market %s, day %s: %v", dataMarket, marker.LastKnownDay, err)
+									} else {
+										log.Printf("✅ [EpochReleased] Successfully sent final rewards update for data market %s, day %s (eligibleNodes=%d)",
+											dataMarket, marker.LastKnownDay, prevDayEligibleNodes)
+										// Remove marker after successful update
+										dayTransitionManager.RemoveMarker(dataMarket, marker.CurrentEpoch)
+										// Optionally reset counts for the previous day after final update
+										submissionCounter.ResetCountsForDay(dataMarket, marker.LastKnownDay)
+									}
+								}
+							}
+						}
+
+						return nil
 					})
 
 					// Start event monitoring

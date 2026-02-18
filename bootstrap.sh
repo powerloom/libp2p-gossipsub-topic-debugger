@@ -35,6 +35,7 @@ if [ -d "$RELAYER_DIR" ]; then
     print_color "$GREEN" "✅ relayer-py directory already exists at $RELAYER_DIR"
     print_color "$CYAN" "💡 To use a different version, remove the directory and run bootstrap again"
     exit 0
+    
 fi
 
 print_color "$CYAN" "📦 Cloning relayer-py repository for development build..."
